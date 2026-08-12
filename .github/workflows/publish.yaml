@@ -1,0 +1,47 @@
+name: 'Publish to NPM'
+on:
+  push:
+    tags: ['*']
+jobs:
+  publish:
+    runs-on: 'ubuntu-latest'
+    permissions:
+      # Required to checkout the code, and to cut the release at the end
+      contents: 'write'
+      # Required to mint the OIDC token that trusted publishing exchanges for npm credentials
+      id-token: 'write'
+
+    steps:
+      - name: 'Checkout code'
+        uses: 'actions/checkout@v7'
+      - name: 'Install Bun'
+        uses: 'oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6'
+        with:
+          bun-version: 'latest'
+      - name: 'Install Bun packages'
+        run: 'bun install --frozen-lockfile'
+      - name: 'Typecheck'
+        run: 'bun run typecheck'
+      - name: 'Test'
+        run: 'bun run test'
+      - name: 'Install Node.js'
+        uses: 'actions/setup-node@v7'
+        with:
+          node-version: '24'
+      # Trusted publishing needs npm 11.5.1 or later, which the runner's Node may trail behind
+      - name: 'Update npm'
+        run: 'npm install --global npm@latest'
+      - name: 'Check the tag matches the version being published'
+        run: |
+          version="$(jq -r .version package.json)"
+
+          if [ "$GITHUB_REF_NAME" != "$version" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match package.json version $version" >&2
+            exit 1
+          fi
+      - name: 'Publish'
+        run: 'npm publish'
+      - name: 'Release'
+        uses: 'softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228'
+        with:
+          generate_release_notes: true

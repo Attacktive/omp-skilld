@@ -1,0 +1,1027 @@
+import type { ExtensionAPI, ExtensionContext } from '@oh-my-pi/pi-coding-agent';
+import { afterAll, expect, test } from 'bun:test';
+import { spawnSync } from 'node:child_process';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readlinkSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import * as pluginModule from './skilld.ts';
+import plugin from './skilld.ts';
+import { ABANDONED_MS, DEFAULT_INTERVAL_MS, FAILURE_COOLDOWN_MS, NOT_EXECUTABLE, NOT_FOUND, PLUGIN_NAME, asInterval, asPlaceholder, asSources, dropPlaceholder, expand, installCommand, isEmpty, isRepo, isSource, isStale, layout, linkSkills, normalize, readPluginSettings, resolveStaging, slugify, staging, swap, sweepGuard } from './internals.ts';
+
+const INTERVAL_MS = 24 * 60 * 60 * 1000;
+
+/** The toasts the plugin has queued but not yet handed over, keyed by the handle it got back. */
+interface PendingToast {
+	after: number;
+	callback: () => void;
+}
+
+const scratch = mkdtempSync(join(tmpdir(), 'skilld-'));
+
+afterAll(() => rmSync(scratch, { recursive: true, force: true }));
+
+interface HeardToast {
+	message: string;
+	type: string;
+}
+
+interface SessionStartHandler {
+	(event: unknown, ctx: ExtensionContext): void | Promise<void>;
+}
+
+/** The slivers of {@link ExtensionAPI} and {@link ExtensionContext} the plugin actually reaches for. The rest cannot be stood up, hence the casts. */
+const listener = () => {
+	const heard: HeardToast[] = [];
+
+	let onSessionStart: SessionStartHandler | undefined;
+
+	const piStub = {
+		on: (event: string, handler: SessionStartHandler) => {
+			if (event === 'session_start') {
+				onSessionStart = handler;
+			}
+		},
+		pi: { settings: { getAgentDir: () => join(scratch, 'agent') } }
+	} as unknown as ExtensionAPI;
+
+	/*
+	 * Every toast the plugin sends is held behind `ctx.setTimeout`, since omp's UI is a set of no-ops until the TUI attaches.
+	 * The queue is the plugin's, not the clock's, so the tests drain it instead of waiting `TOAST_DELAY_MS` out in real time.
+	 */
+	const pending = new Map<object, PendingToast>();
+
+	const ctxStub = {
+		ui: {
+			notify: (message: string, type: 'info' | 'warning' | 'error' = 'info') => {
+				heard.push({ message, type });
+			}
+		},
+		hasUI: true,
+		cwd: scratch,
+		setTimeout: (callback: () => void, after = 0) => {
+			// The handle is its own key: omp hands one back and takes the same one in `clearTimer`, so nothing ever has to be read off it.
+			const handle = { unref: () => undefined };
+
+			pending.set(handle, { after, callback });
+
+			return handle as unknown as Timer;
+		},
+		clearTimer: (timer: Timer) => {
+			pending.delete(timer);
+		}
+	} as unknown as ExtensionContext;
+
+	/** Hands over every queued toast, soonest first, including any queued by the ones already handed over. */
+	const flush = () => {
+		// A toast queued by a toast is the only nesting there is, so two rounds is one more than it takes; the bound is what keeps a mistake from spinning here.
+		for (let round = 0; round < 4 && pending.size > 0; round += 1) {
+			const due = [...pending.entries()].sort(([, one], [, other]) => one.after - other.after);
+
+			pending.clear();
+
+			for (const [, { callback }] of due) {
+				callback();
+			}
+		}
+	};
+
+	/** `session_start` starts the sweep without awaiting it; this is where its settings read lands, without pinning anything to the clock. */
+	const settle = () => new Promise<void>((resolve) => void setImmediate(resolve));
+
+	/** Writes the settings the way omp persists them, runs one sweep, and hands over whatever it had to say. */
+	const run = async (settings: unknown) => {
+		mkdirSync(join(scratch, 'plugins'), { recursive: true });
+		writeFileSync(join(scratch, 'plugins', 'omp-plugins.lock.json'), JSON.stringify({ settings: { [PLUGIN_NAME]: settings } }));
+
+		process.env.XDG_DATA_HOME = join(scratch, 'xdg');
+
+		sweepGuard.done = false;
+
+		plugin(piStub);
+
+		await onSessionStart?.({}, ctxStub);
+		await settle();
+
+		flush();
+	};
+
+	return { heard, run };
+};
+
+test(
+	'the module hands omp a factory as its default export, which is the whole contract the loader checks',
+	() => {
+		// `getExtensionFactory` takes `module.default` and rejects the extension outright when it is not callable.
+		expect(typeof pluginModule.default)
+			.toBe('function');
+	}
+);
+
+test(
+	'slugify replaces the separator so a repo can name a directory',
+	() => expect(slugify('anthropics/skills')).toBe('anthropics-skills')
+);
+
+test(
+	'slugify leaves a name with nothing to replace alone',
+	() => expect(slugify('skills')).toBe('skills')
+);
+
+test(
+	'expand turns a leading tilde into a real path, since nothing here goes through a shell',
+	() => {
+		expect(expand('~/skills'))
+			.toBe(`${homedir()}/skills`);
+
+		expect(expand('~'))
+			.toBe(homedir());
+	}
+);
+
+test(
+	'expand leaves a path alone when the tilde is not the whole first segment',
+	() => {
+		expect(expand('/opt/~/skills'))
+			.toBe('/opt/~/skills');
+
+		expect(expand('~user/skills'))
+			.toBe('~user/skills');
+	}
+);
+
+test(
+	'asInterval defaults only when nothing was configured',
+	() => {
+		expect(asInterval(undefined))
+			.toBe(DEFAULT_INTERVAL_MS);
+
+		expect(asInterval(3_600_000))
+			.toBe(3_600_000);
+	}
+);
+
+test(
+	'asInterval refuses whatever is not a finite number of milliseconds',
+	() => {
+		expect(asInterval('daily'))
+			.toBeUndefined();
+
+		expect(asInterval(Number.NaN))
+			.toBeUndefined();
+
+		expect(asInterval(Number.POSITIVE_INFINITY))
+			.toBeUndefined();
+	}
+);
+
+test(
+	'asPlaceholder defaults only when nothing was configured',
+	() => {
+		expect(asPlaceholder(undefined))
+			.toBe('template');
+
+		expect(asPlaceholder('example'))
+			.toBe('example');
+
+		expect(asPlaceholder(false))
+			.toBe(false);
+	}
+);
+
+test(
+	'asPlaceholder refuses anything that would point rmSync at the target itself',
+	() => {
+		expect(asPlaceholder(''))
+			.toBe(false);
+
+		expect(asPlaceholder('.'))
+			.toBe(false);
+	}
+);
+
+test(
+	'asPlaceholder refuses anything that would point rmSync outside the target',
+	() => {
+		expect(asPlaceholder('..'))
+			.toBe(false);
+
+		expect(asPlaceholder('../../skills'))
+			.toBe(false);
+
+		expect(asPlaceholder('nested/template'))
+			.toBe(false);
+
+		expect(asPlaceholder('nested\\template'))
+			.toBe(false);
+	}
+);
+
+test(
+	'isSource accepts the two documented shapes',
+	() => {
+		expect(isSource('anthropics/skills'))
+			.toBe(true);
+
+		expect(isSource({ repo: 'anthropics/skills' }))
+			.toBe(true);
+
+		expect(isSource({ repo: 'anthropics/skills', target: '~/skills', stamp: '~/stamp', label: 'the skills', placeholder: false }))
+			.toBe(true);
+	}
+);
+
+test(
+	'isSource rejects whatever else a hand-written config file might hold',
+	() => {
+		expect(isSource(''))
+			.toBe(false);
+
+		expect(isSource({ target: '/skills' }))
+			.toBe(false);
+
+		expect(isSource({ repo: '' }))
+			.toBe(false);
+
+		expect(isSource({ repo: 42 }))
+			.toBe(false);
+
+		expect(isSource(null))
+			.toBe(false);
+
+		expect(isSource(undefined))
+			.toBe(false);
+
+		expect(isSource({ repo: 'anthropics/skills', target: 123 }))
+			.toBe(false);
+
+		expect(isSource({ repo: 'anthropics/skills', stamp: true }))
+			.toBe(false);
+
+		expect(isSource({ repo: 'anthropics/skills', label: {} }))
+			.toBe(false);
+
+		expect(isSource({ repo: 'anthropics/skills', placeholder: 123 }))
+			.toBe(false);
+
+		expect(isSource({ repo: 'anthropics/skills', target: '' }))
+			.toBe(false);
+
+		expect(isSource({ repo: 'anthropics/skills', stamp: '' }))
+			.toBe(false);
+	}
+);
+
+test(
+	'layout keeps downloads beside the agent directory and publishes into the skills directory omp scans itself',
+	() => {
+		expect(layout(join(homedir(), '.omp', 'agent')))
+			.toEqual({ root: join(homedir(), '.omp', 'skilld'), linkRoot: join(homedir(), '.omp', 'agent', 'skills') });
+
+		expect(layout('/xdg/omp/agent'))
+			.toEqual({ root: '/xdg/omp/skilld', linkRoot: '/xdg/omp/agent/skills' });
+	}
+);
+
+/** A downloaded target as `gh` leaves it: one directory per skill, each with the `SKILL.md` that makes it one. */
+const downloaded = (name: string, skills: string[]) => {
+	const target = join(scratch, name, 'target');
+	const linkRoot = join(scratch, name, 'skills');
+
+	for (const skill of skills) {
+		mkdirSync(join(target, skill), { recursive: true });
+		writeFileSync(join(target, skill, 'SKILL.md'), '');
+	}
+
+	return { target, linkRoot };
+};
+
+test(
+	'linkSkills publishes every downloaded skill, and only the ones that are skills',
+	() => {
+		const { target, linkRoot } = downloaded('link-fresh', ['pdf', 'docx']);
+
+		mkdirSync(join(target, 'not-a-skill'), { recursive: true });
+
+		expect(linkSkills(target, linkRoot).linked.sort())
+			.toEqual(['docx', 'pdf']);
+
+		expect(readlinkSync(join(linkRoot, 'pdf')))
+			.toBe(join(target, 'pdf'));
+
+		expect(existsSync(join(linkRoot, 'not-a-skill')))
+			.toBe(false);
+	}
+);
+
+test(
+	'linkSkills is idempotent, so a second launch relinks nothing',
+	() => {
+		const { target, linkRoot } = downloaded('link-again', ['pdf']);
+
+		linkSkills(target, linkRoot);
+
+		expect(linkSkills(target, linkRoot))
+			.toEqual({ linked: [], refused: [] });
+	}
+);
+
+test(
+	'linkSkills refuses a name the user already holds, whether their own skill or a link of their own',
+	() => {
+		const { target, linkRoot } = downloaded('link-taken', ['pdf', 'docx']);
+		const mine = join(scratch, 'link-taken', 'mine');
+
+		mkdirSync(join(linkRoot, 'pdf'), { recursive: true });
+		mkdirSync(mine, { recursive: true });
+		symlinkSync(mine, join(linkRoot, 'docx'), 'dir');
+
+		const { linked, refused } = linkSkills(target, linkRoot);
+
+		expect(linked)
+			.toEqual([]);
+
+		// Sorted: what the directory hands back is in whatever order the filesystem keeps, not the order the download was written in.
+		expect(refused.sort())
+			.toEqual(['docx', 'pdf']);
+
+		expect(readlinkSync(join(linkRoot, 'docx')))
+			.toBe(mine);
+	}
+);
+
+test(
+	'linkSkills sweeps its own link once the skill behind it is gone, and leaves the user everything else',
+	() => {
+		const { target, linkRoot } = downloaded('link-stale', ['pdf', 'dropped']);
+		const theirs = join(scratch, 'link-stale', 'theirs');
+
+		linkSkills(target, linkRoot);
+		mkdirSync(theirs, { recursive: true });
+		symlinkSync(theirs, join(linkRoot, 'kept'), 'dir');
+		rmSync(join(target, 'dropped'), { recursive: true, force: true });
+
+		expect(linkSkills(target, linkRoot))
+			.toEqual({ linked: [], refused: [] });
+
+		// The listing, rather than `existsSync`, because a link left dangling would read as absent while still sitting there.
+		expect(readdirSync(linkRoot).sort())
+			.toEqual(['kept', 'pdf']);
+
+		expect(readlinkSync(join(linkRoot, 'kept')))
+			.toBe(theirs);
+	}
+);
+
+test(
+	'normalize derives every path from a bare repo string',
+	() => {
+		const source = normalize('anthropics/skills', '/omp/skilld');
+
+		expect(source).toEqual({
+			repo: 'anthropics/skills',
+			target: '/omp/skilld/anthropics-skills',
+			stamp: '/omp/skilld/.anthropics-skills-refreshed',
+			label: 'anthropics/skills',
+			placeholder: 'template'
+		});
+	}
+);
+
+test(
+	'a fresh target republishes a deleted link on the next launch without downloading again',
+	async () => {
+		const target = join(scratch, 'self-heal', 'target');
+		const stamp = join(scratch, 'self-heal', 'stamp');
+		const linkRoot = join(scratch, 'agent', 'skills');
+
+		mkdirSync(join(target, 'pdf'), { recursive: true });
+		writeFileSync(join(target, 'pdf', 'SKILL.md'), '');
+		writeFileSync(stamp, '');
+		mkdirSync(linkRoot, { recursive: true });
+		symlinkSync(join(target, 'pdf'), join(linkRoot, 'pdf'), 'dir');
+		rmSync(join(linkRoot, 'pdf'));
+
+		const { run } = listener();
+		await run({ sources: [{ repo: 'someone/their-skills', target, stamp }], interval: INTERVAL_MS });
+
+		expect(readlinkSync(join(linkRoot, 'pdf')))
+			.toBe(join(target, 'pdf'));
+	}
+);
+
+test(
+	'normalize hides the stamp outside the target, so what omp scans holds skills and nothing else',
+	() => {
+		const { target, stamp } = normalize('anthropics/skills', '/omp/skilld');
+
+		expect(stamp.startsWith(`${target}/`))
+			.toBe(false);
+
+		expect(dirname(stamp))
+			.toBe(dirname(target));
+	}
+);
+
+test(
+	'normalize fills the same defaults in for an object that only names a repo',
+	() => expect(normalize({ repo: 'anthropics/skills' }, '/omp/skilld'))
+		.toEqual(normalize('anthropics/skills', '/omp/skilld'))
+);
+
+test(
+	'normalize honours every override',
+	() => {
+		const overridden = {
+			repo: 'someone/their-skills',
+			target: '/skills',
+			stamp: '/state/stamp',
+			label: 'their skills',
+			placeholder: 'example'
+		};
+
+		expect(normalize(overridden, '/omp/skilld'))
+			.toEqual(overridden);
+	}
+);
+
+test(
+	'normalize keeps `placeholder: false` rather than defaulting it, so nothing is deleted',
+	() => expect(normalize({ repo: 'someone/their-skills', placeholder: false }, '/omp/skilld').placeholder)
+		.toBe(false)
+);
+
+test(
+	'normalize expands a tilde in the paths it was handed',
+	() => {
+		const source = normalize({ repo: 'someone/their-skills', target: '~/skills', stamp: '~/state/stamp' }, '/omp/skilld');
+
+		expect(source.target)
+			.toBe(`${homedir()}/skills`);
+
+		expect(source.stamp)
+			.toBe(`${homedir()}/state/stamp`);
+	}
+);
+
+test(
+	'normalize drops a placeholder that would have deleted the whole target',
+	() => expect(normalize({ repo: 'someone/their-skills', placeholder: '' }, '/omp/skilld').placeholder)
+		.toBe(false)
+);
+
+test(
+	'staging hides both directories beside the target, so a scan ignores them and the swap stays a rename',
+	() => expect(staging('/skills/anthropic'))
+		.toEqual({ incoming: '/skills/.anthropic.incoming', outgoing: '/skills/.anthropic.outgoing', done: '/skills/.anthropic.done', failed: '/skills/.anthropic.failed' })
+);
+
+/** A staging area as an earlier launch would have left it: the download, plus whatever marker recorded how it ended. */
+const staged = (name: string, marker?: 'done' | 'failed', age = 0) => {
+	const target = join(scratch, name);
+	const { incoming, done, failed } = staging(target);
+
+	mkdirSync(join(incoming, 'a-skill'), { recursive: true });
+
+	if (marker === 'done') {
+		writeFileSync(done, '');
+	}
+
+	if (marker === 'failed') {
+		writeFileSync(failed, '');
+	}
+
+	if (age > 0) {
+		const when = new Date(Date.now() - age);
+
+		utimesSync(incoming, when, when);
+
+		if (marker !== undefined) {
+			utimesSync(marker === 'done' ? done : failed, when, when);
+		}
+	}
+
+	return { target, incoming, done, failed };
+};
+
+test(
+	'resolveStaging stands in a download that finished after the launch which started it died',
+	() => {
+		const { target, incoming } = staged('resolve-done', 'done');
+
+		expect(resolveStaging(target, join(scratch, 'never-refreshed'), INTERVAL_MS))
+			.toBe('finish');
+
+		// Left for the caller to install: deciding is not the same as swapping.
+		expect(existsSync(incoming))
+			.toBe(true);
+	}
+);
+
+test(
+	'resolveStaging drops the marker of a download whose refresh has already been recorded',
+	() => {
+		const { target, done } = staged('resolve-done-fresh', 'done');
+
+		const stamp = join(scratch, 'resolve-done-fresh-stamp');
+		writeFileSync(stamp, '');
+
+		expect(resolveStaging(target, stamp, INTERVAL_MS))
+			.toBe('skip');
+
+		expect(existsSync(done))
+			.toBe(false);
+	}
+);
+
+test(
+	'resolveStaging holds off after a failure, so a launch loop cannot spend the rate limit an attempt at a time',
+	() => {
+		const { target, incoming, failed } = staged('resolve-failed-recent', 'failed');
+
+		expect(resolveStaging(target, join(scratch, 'never-refreshed'), INTERVAL_MS))
+			.toBe('cooling');
+
+		// Both are the record of that failure: sweeping either would forget it and try again next launch.
+		expect(existsSync(failed))
+			.toBe(true);
+
+		expect(existsSync(incoming))
+			.toBe(true);
+	}
+);
+
+test(
+	'resolveStaging sweeps a failure old enough to be worth another attempt',
+	() => {
+		const { target, incoming, failed } = staged('resolve-failed', 'failed', FAILURE_COOLDOWN_MS + 60_000);
+
+		expect(resolveStaging(target, join(scratch, 'never-refreshed'), INTERVAL_MS))
+			.toBe('failed');
+
+		expect(existsSync(incoming))
+			.toBe(false);
+
+		expect(existsSync(failed))
+			.toBe(false);
+	}
+);
+
+test(
+	'resolveStaging leaves a download that is still running alone, however short the interval',
+	() => {
+		const { target, incoming } = staged('resolve-running');
+
+		// Zero interval: every launch counts as due. The download still owns its directory.
+		expect(resolveStaging(target, join(scratch, 'never-refreshed'), 0))
+			.toBe('in-flight');
+
+		expect(existsSync(incoming))
+			.toBe(true);
+	}
+);
+
+test(
+	'resolveStaging sweeps a download nothing has touched since long before a download could take',
+	() => {
+		const { target, incoming } = staged('resolve-abandoned', undefined, ABANDONED_MS + 60_000);
+
+		expect(resolveStaging(target, join(scratch, 'never-refreshed'), INTERVAL_MS))
+			.toBe('skip');
+
+		expect(existsSync(incoming))
+			.toBe(false);
+	}
+);
+
+/**
+ * Runs the real wrapper with a `PATH` holding only what the case wants `gh` to be, so the markers are the shell's own doing and no `gh` installed on this machine can be reached.
+ * Nothing else the command needs — `[`, `:`, the redirection — lives outside the shell, which is what makes that `PATH` enough; the shell itself is spawned by absolute path, since Node resolves the executable through the same `PATH` the case has emptied.
+ */
+const runInstall = (name: string, gh?: { script: string; mode: number }) => {
+	const home = join(scratch, name);
+	const bin = join(home, 'bin');
+	const { incoming, done, failed } = staging(join(home, 'target'));
+
+	mkdirSync(bin, { recursive: true });
+
+	if (gh !== undefined) {
+		const path = join(bin, 'gh');
+
+		writeFileSync(path, gh.script);
+		chmodSync(path, gh.mode);
+	}
+
+	const { status, error } = spawnSync('/bin/sh', ['-c', installCommand('anthropics/skills', incoming, done, failed)], { env: { PATH: bin }, stdio: 'ignore' });
+
+	if (error !== undefined) {
+		throw error;
+	}
+
+	return { status, done: existsSync(done), failed: existsSync(failed) };
+};
+
+test(
+	'a `gh` that cannot be found leaves no marker, so a cooldown it never earned is not armed',
+	() => {
+		expect(runInstall('gh-missing'))
+			.toEqual({ status: NOT_FOUND, done: false, failed: false });
+	}
+);
+
+test(
+	'a `gh` that cannot be executed leaves no marker either',
+	() => {
+		expect(runInstall('gh-unrunnable', { script: '#!/bin/sh\nexit 0\n', mode: 0o644 }))
+			.toEqual({ status: NOT_EXECUTABLE, done: false, failed: false });
+	}
+);
+
+test(
+	'a `gh` that ran and failed leaves the failure marker the cooldown reads',
+	() => {
+		expect(runInstall('gh-failed', { script: '#!/bin/sh\nexit 1\n', mode: 0o755 }))
+			.toEqual({ status: 1, done: false, failed: true });
+	}
+);
+
+test(
+	'a `gh` that succeeded leaves the completion marker a later launch installs from',
+	() => {
+		expect(runInstall('gh-succeeded', { script: '#!/bin/sh\nexit 0\n', mode: 0o755 }))
+			.toEqual({ status: 0, done: true, failed: false });
+	}
+);
+
+test(
+	'asSources takes the bare list most configurations are, since the CLI can only store text',
+	() => {
+		expect(asSources('anthropics/skills'))
+			.toEqual(['anthropics/skills']);
+
+		expect(asSources('anthropics/skills, someone/their-skills'))
+			.toEqual(['anthropics/skills', 'someone/their-skills']);
+
+		expect(asSources(' anthropics/skills\nsomeone/their-skills '))
+			.toEqual(['anthropics/skills', 'someone/their-skills']);
+	}
+);
+
+test(
+	'asSources still reads the JSON a per-source override needs, as a list or a single object',
+	() => {
+		expect(asSources('[{"repo":"anthropics/skills","label":"skills"}]'))
+			.toEqual([{ repo: 'anthropics/skills', label: 'skills' }]);
+
+		expect(asSources('{"repo":"anthropics/skills"}'))
+			.toEqual([{ repo: 'anthropics/skills' }]);
+	}
+);
+
+test(
+	'asSources passes an array through and refuses what is neither a list nor text',
+	() => {
+		const configured = [{ repo: 'anthropics/skills' }];
+
+		expect(asSources(configured))
+			.toBe(configured);
+
+		expect(asSources(''))
+			.toEqual([]);
+
+		expect(asSources(42))
+			.toBeUndefined();
+
+		expect(asSources('[{"repo":'))
+			.toBeUndefined();
+	}
+);
+
+test(
+	'isRepo accepts an `owner/repo` and refuses what `gh` would only fail on',
+	() => {
+		expect(['anthropics/skills', 'some-one/their_skills.v2'].every(isRepo))
+			.toBe(true);
+
+		expect(['', 'skills', 'anthropics/', '/skills', 'anthropics/skills/extra', 'not a repo', 'anthropics/skills;rm -rf /'].some(isRepo))
+			.toBe(false);
+	}
+);
+
+test(
+	'dropPlaceholder deletes the placeholder skill a template repository ships',
+	() => {
+		const incoming = join(scratch, 'placeholder-download');
+		mkdirSync(join(incoming, 'template'), { recursive: true });
+		writeFileSync(join(incoming, 'template', 'SKILL.md'), '---\nname: template\ndescription: Replace with description of the skill and when Claude should use it.\n---\n');
+
+		expect(dropPlaceholder(incoming, 'template'))
+			.toBe(true);
+
+		expect(existsSync(join(incoming, 'template')))
+			.toBe(false);
+	}
+);
+
+test(
+	'dropPlaceholder keeps a real skill that merely goes by the placeholder name',
+	() => {
+		const incoming = join(scratch, 'real-template-skill');
+		mkdirSync(join(incoming, 'template'), { recursive: true });
+		writeFileSync(join(incoming, 'template', 'SKILL.md'), '---\nname: template\ndescription: Scaffolds a new service from the house template.\n---\n');
+
+		expect(dropPlaceholder(incoming, 'template'))
+			.toBe(false);
+
+		expect(existsSync(join(incoming, 'template')))
+			.toBe(true);
+	}
+);
+
+test(
+	'dropPlaceholder leaves alone what it cannot recognise, and does nothing at all when turned off',
+	() => {
+		const incoming = join(scratch, 'unrecognisable-placeholder');
+		mkdirSync(join(incoming, 'template', 'assets'), { recursive: true });
+
+		// No `SKILL.md`, so nothing says what this is; a guess here deletes somebody's directory.
+		expect(dropPlaceholder(incoming, 'template'))
+			.toBe(false);
+
+		expect(dropPlaceholder(incoming, false))
+			.toBe(false);
+
+		expect(existsSync(join(incoming, 'template', 'assets')))
+			.toBe(true);
+	}
+);
+
+test(
+	'readPluginSettings lets a project override the settings, from an ancestor directory as omp does',
+	async () => {
+		const root = join(scratch, 'project');
+		const deep = join(root, 'packages', 'thing');
+		mkdirSync(join(root, '.omp'), { recursive: true });
+		mkdirSync(deep, { recursive: true });
+
+		// omp keeps the lock beside the agent directory, under the same root.
+		const ompRoot = join(scratch, 'override-root');
+		mkdirSync(join(ompRoot, 'plugins'), { recursive: true });
+		writeFileSync(join(ompRoot, 'plugins', 'omp-plugins.lock.json'), JSON.stringify({ settings: { [PLUGIN_NAME]: { sources: 'anthropics/skills', interval: 1 } } }));
+
+		writeFileSync(join(root, '.omp', 'plugin-overrides.json'), JSON.stringify({ settings: { [PLUGIN_NAME]: { sources: 'someone/their-skills' } } }));
+
+		const { options, error } = await readPluginSettings(join(ompRoot, 'agent'), deep);
+
+		expect(error).toBeUndefined();
+
+		// The project's `sources` wins; the interval it says nothing about is still the global one.
+		expect(options)
+			.toEqual({ sources: 'someone/their-skills', interval: 1 });
+	}
+);
+
+test(
+	'swap stands a finished download in for the live directory',
+	() => {
+		const target = join(scratch, 'swap-live');
+		const { incoming, outgoing } = staging(target);
+
+		mkdirSync(join(target, 'stale-skill'), { recursive: true });
+		mkdirSync(join(incoming, 'fresh-skill'), { recursive: true });
+
+		mkdirSync(join(outgoing, 'debris'), { recursive: true });
+
+		swap(target);
+
+		expect(existsSync(join(target, 'fresh-skill')))
+			.toBe(true);
+
+		expect(existsSync(join(target, 'stale-skill')))
+			.toBe(false);
+
+		expect(existsSync(incoming))
+			.toBe(false);
+
+		expect(existsSync(outgoing))
+			.toBe(false);
+	}
+);
+
+test(
+	'swap installs a download when no live directory exists yet, as on a first refresh',
+	() => {
+		const target = join(scratch, 'swap-first-run');
+		const { incoming } = staging(target);
+
+		mkdirSync(join(incoming, 'fresh-skill'), { recursive: true });
+
+		swap(target);
+
+		expect(existsSync(join(target, 'fresh-skill')))
+			.toBe(true);
+	}
+);
+
+test(
+	'swap puts the live directory back when there is nothing to stand in for it',
+	() => {
+		const target = join(scratch, 'swap-restore');
+		mkdirSync(join(target, 'precious-skill'), { recursive: true });
+
+		expect(() => swap(target))
+			.toThrow();
+
+		expect(existsSync(join(target, 'precious-skill')))
+			.toBe(true);
+	}
+);
+
+test(
+	'swap leaves no target behind when a first refresh has nothing to stand in',
+	() => {
+		const target = join(scratch, 'swap-first-run-restore');
+
+		expect(() => swap(target))
+			.toThrow();
+
+		expect(existsSync(target))
+			.toBe(false);
+	}
+);
+
+test(
+	'swap shrugs off a parked directory that will not clear, since the install itself has already succeeded',
+	() => {
+		const target = join(scratch, 'swap-cleanup');
+		const { incoming, outgoing } = staging(target);
+
+		mkdirSync(join(target, 'stale-skill'), { recursive: true });
+		writeFileSync(join(target, 'stale-skill', 'SKILL.md'), '');
+		mkdirSync(join(incoming, 'fresh-skill'), { recursive: true });
+
+		/*
+		 * Stripping the write bit keeps the parked skill's contents from being unlinked, which fails the final cleanup and nothing else.
+		 * Windows ignores the bit on directories and root ignores it everywhere, so there the cleanup simply succeeds — the assertions hold either way.
+		 */
+		chmodSync(join(target, 'stale-skill'), 0o555);
+
+		try {
+			expect(() => swap(target))
+				.not.toThrow();
+
+			expect(existsSync(join(target, 'fresh-skill')))
+				.toBe(true);
+		} finally {
+			const parked = join(outgoing, 'stale-skill');
+
+			if (existsSync(parked)) {
+				chmodSync(parked, 0o755);
+			}
+		}
+	}
+);
+
+test(
+	'isStale is stale when there is no stamp at all',
+	() => expect(isStale(join(scratch, 'never-refreshed'), INTERVAL_MS))
+		.toBe(true)
+);
+
+test(
+	'isStale is fresh when the stamp was just written',
+	() => {
+		const stamp = join(scratch, 'just-refreshed');
+		writeFileSync(stamp, '');
+
+		expect(isStale(stamp, INTERVAL_MS))
+			.toBe(false);
+	}
+);
+
+test(
+	'isStale is stale once the stamp is older than the interval',
+	() => {
+		const stamp = join(scratch, 'refreshed-long-ago');
+		writeFileSync(stamp, '');
+
+		const wellPastTheInterval = new Date(Date.now() - 2 * INTERVAL_MS);
+		utimesSync(stamp, wellPastTheInterval, wellPastTheInterval);
+
+		expect(isStale(stamp, INTERVAL_MS))
+			.toBe(true);
+	}
+);
+
+test(
+	'isEmpty is empty when the directory does not exist',
+	() => expect(isEmpty(join(scratch, 'absent')))
+		.toBe(true)
+);
+
+test(
+	'isEmpty is empty when the directory exists with nothing in it',
+	() => {
+		const target = join(scratch, 'bare');
+		mkdirSync(target, { recursive: true });
+
+		expect(isEmpty(target))
+			.toBe(true);
+	}
+);
+
+test(
+	'isEmpty is not empty once a skill has been installed',
+	() => {
+		const target = join(scratch, 'populated');
+		mkdirSync(join(target, 'some-skill'), { recursive: true });
+
+		expect(isEmpty(target))
+			.toBe(false);
+	}
+);
+
+test(
+	'the plugin says nothing at all until it is configured',
+	async () => {
+		const { heard, run } = listener();
+
+		await run({});
+		await run({ sources: [] });
+
+		expect(heard).toEqual([]);
+	}
+);
+
+test(
+	'the plugin reports malformed options rather than throwing on them',
+	async () => {
+		const cases = [
+			// Not text and not a list, so there is nothing to read as a repository at all.
+			{ sources: 42 },
+			{ sources: [{ target: '/nowhere' }] },
+			{ sources: [{ repo: 'someone/their-skills', target: 123 }] },
+			{ sources: [], interval: 'daily' },
+			{ source: ['anthropics/skills'] },
+			// Text, but no `owner/repo` in it — refused here rather than handed to `gh` to fail on.
+			{ sources: 'nope' },
+			{ sources: [{ repo: 'not a repo' }] }
+		];
+
+		const { heard, run } = listener();
+
+		for (const options of cases) {
+			await run(options);
+		}
+
+		expect(heard.map((toast) => toast.type))
+			.toEqual(['error', 'error', 'error', 'error', 'error', 'error', 'error']);
+
+		expect(heard[0]?.message)
+			.toContain('list of repositories');
+
+		expect(heard[4]?.message)
+			.toContain('`source`');
+
+		expect(heard[5]?.message)
+			.toContain('malformed source');
+	}
+);
+
+test(
+	'the plugin accepts `sources` as a JSON string, since that is what the CLI stores',
+	async () => {
+		const target = join(scratch, 'string-form-target');
+		const stamp = join(scratch, 'string-form-refreshed');
+		writeFileSync(stamp, '');
+
+		const { heard, run } = listener();
+
+		await run({
+			sources: JSON.stringify([{ repo: 'someone/their-skills', target, stamp }])
+		});
+
+		expect(heard).toEqual([]);
+	}
+);
+
+test(
+	'the plugin leaves the target alone when a placeholder would have taken it with it',
+	async () => {
+		const target = join(scratch, 'not-to-be-deleted');
+		mkdirSync(join(target, 'precious-skill'), { recursive: true });
+		writeFileSync(join(target, 'precious-skill', 'SKILL.md'), '');
+
+		// A stamp written just now keeps the test off the network: the source counts as fresh, so the plugin only ensures the directory exists and sweeps staging.
+		const stamp = join(scratch, 'refreshed-just-now');
+		writeFileSync(stamp, '');
+
+		const { run } = listener();
+
+		await run({
+			sources: [{ repo: 'someone/their-skills', target, stamp, placeholder: '' }]
+		});
+
+		expect(existsSync(join(target, 'precious-skill', 'SKILL.md')))
+			.toBe(true);
+	}
+);

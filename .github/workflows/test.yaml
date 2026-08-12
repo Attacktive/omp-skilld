@@ -1,0 +1,28 @@
+name: 'Bun Test'
+on:
+  push:
+    branches: ['main']
+  pull_request:
+    branches: ['main']
+jobs:
+  test:
+    runs-on: 'ubuntu-latest'
+    permissions:
+      # Required to checkout the code
+      contents: 'read'
+
+    steps:
+      - name: 'Checkout code'
+        uses: 'actions/checkout@v7'
+      - name: 'Install Bun'
+        uses: 'oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6'
+        with:
+          bun-version: 'latest'
+      - name: 'Install Bun packages'
+        run: 'bun install --frozen-lockfile'
+      - name: 'Typecheck'
+        run: 'bun run typecheck'
+      - name: 'Lint'
+        run: 'bun run lint'
+      - name: 'Test'
+        run: 'bun run test'
