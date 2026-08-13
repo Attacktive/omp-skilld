@@ -62,7 +62,7 @@ omp plugin config set omp-skilld sources '[{"repo": "anthropics/skills", "target
 omp plugin config set omp-skilld interval 604800000
 ```
 
-A project can override any of it for itself in `.omp/plugin-overrides.json`, which OMP looks for in the working directory and every directory above it — nearest one wins:
+A project can override any of it for itself in `.omp/plugin-overrides.json`, which OMP looks for in the working directory — there and nowhere else, so the override that applies is always the one `omp plugin config list` would show. The plugin asks OMP for its settings rather than resolving them itself, so the lock is found wherever OMP keeps it — the XDG layout included — and a `plugin-overrides.json` that will not parse is skipped exactly the way OMP skips it:
 
 ```json
 {
@@ -123,7 +123,7 @@ Nothing else is — not `$VAR`, not `~user` — because these go straight to `mk
 ### About `placeholder`
 
 Repositories started from GitHub's skill template ship a `template/` skill described as *"Replace with description of the skill and when Claude should use it."* It has a description, so nothing filters it out, and a trigger that vague fires on almost anything.
-Skilld drops it — but only when the directory still says that about itself.
+Skilld drops it — but only when the directory still says that about itself, in its frontmatter `description`; a skill that merely quotes the phrase in its body is not touched.
 A repository that ships a real skill called `template` keeps it, and a `template/` with no `SKILL.md` in it is left alone rather than guessed about.
 
 Point `placeholder` at a different name if a repository calls its placeholder something else, or set it to `false` to skip the check entirely.
@@ -156,21 +156,24 @@ A flat list of directories, and not too many. A repository that files skills by 
 ## Behaviour
 
 - Refreshes at most once per `interval` per source, tracked by a stamp file that is written **after** a refresh succeeds — so an interrupted one simply retries next launch.
-- Downloads into a hidden staging directory beside `target` and stands it in for the live one only once `gh` has succeeded, so OMP never scans a half-written skill set. Beside it rather than under `TMPDIR` because a rename across filesystems fails, and hidden so a scan cannot mistake it for a skill. Nothing appears at `target` until a refresh has actually succeeded. Not a single atomic step — nothing Node exposes can exchange two directories — but the live directory is absent for two renames rather than for the length of a download, and a swap that fails puts the previous skills back rather than leaving a gap.
+- Downloads into a hidden staging directory beside `target` and stands it in for the live one only once `gh` has succeeded, so OMP never scans a half-written skill set. Beside it rather than under `TMPDIR` because a rename across filesystems fails, and hidden so a scan cannot mistake it for a skill. Nothing appears at `target` until a refresh has actually succeeded. Not a single atomic step — nothing Node exposes can exchange two directories — but the live directory is absent for two renames rather than for the length of a download, and a swap that fails puts the previous skills back rather than leaving a gap. A launch killed *between* those two renames leaves the previous skills parked beside the target, and the next launch stands them back in rather than sweeping them.
+- A finished download that could not be installed — the target's parent unwritable, say — keeps its claim, so the next launch retries the install rather than paying for the download again.
 - Never awaited, and the download is detached, so quitting OMP never waits on one — and never kills one either. A download that outlives its launch records how it ended beside the staging directory; the next launch installs a finished one instead of downloading it again. Two launches that find the same finished download cannot both install it: claiming it is a single unlink, and the one that loses it stands aside.
-- A download still running is left alone, however short the interval. One that has not touched its staging directory in fifteen minutes is taken for dead — a reboot mid-download, say — and swept so the next attempt starts clean.
+- A download still running is left alone, however short the interval. Each download records its process id beside its staging directory, so a launch asks the process itself: alive means left alone however quiet the directory, gone means swept at once — a reboot mid-download, say. Only a download with no pid to ask falls back to the clock: one whose staging area has seen no new file anywhere in fifteen minutes is taken for dead and swept, so the next attempt starts clean.
 - A failed download is left alone for an hour before another is attempted, which is what keeps a rate limit or an expired login from costing an attempt per launch. Its staging directory is kept as the record of that failure, and swept when the hour is up. A `gh` that was never found, or could not be run, is exempt: none of the rate limit was spent, so installing it and relaunching refreshes at once instead of an hour later.
 - Publishes into `~/.omp/agent/skills` as one symlink per skill, on every launch rather than only after a download, so a link deleted by hand or a name freed since the last refresh is repaired at once. A link into the download root is the plugin's to remove; anything else there is yours and is never touched, which is also how a skill dropped upstream gets its name freed again.
 - A name already taken by a directory of your own is left alone rather than replaced, and reported to the log. The download still refreshes, so freeing the name is all it takes to get it.
 - Nothing throws. A missing `gh`, an expired login, a plane — all of them degrade to an error toast, never a broken launch.
 - Every outcome is written to OMP's log (`~/.omp/logs/omp.<date>.<pid>.log`) as well as toasted, because the launches that need explaining most — `omp -p`, a CI run — have no TUI to toast into.
-- Every toast is held back a few seconds, because extensions load before the TUI attaches and OMP's UI is a set of no-ops until it does, so a toast fired into that gap is not delayed but lost — which is exactly when a missing `gh` fails. A refresh that finishes inside that window cancels the "in the background" message rather than following it.
+- The "in the background" announcement is held back a few seconds, so a refresh that settles within the first beat — a missing `gh` fails in milliseconds — speaks for itself instead of arriving after a promise it already broke. Everything else is said the moment it happens.
 - The sweep runs once per launch, on the first session — subagents do not each get their own refresh.
 
 ## Windows
 
-Children are not reaped with their parent there, so `gh` is spawned directly rather than through a shell: neither Git Bash nor WSL is involved, and the `ENOENT` that bites `.cmd` shims never comes up.
+Children are not reaped with their parent there, so `gh` is spawned directly rather than through a shell: neither Git Bash nor WSL is involved.
+The completion and failure markers are written by the plugin's own exit handler instead, so a download that ends while OMP is still running is recorded exactly as everywhere else — the failure cooldown included, which is what keeps an expired login from costing an attempt per launch.
 The trade is that a download outliving its launch is not recorded, so it costs one redundant download rather than being installed by the next launch — the behaviour every platform had before the markers.
+A `gh` installed as a `.cmd` shim cannot be spawned this way; that surfaces as a "could not refresh" error toast, and installing the real executable (winget, scoop, the MSI) is the fix.
 
 `~` in `target` and `stamp` resolves through `os.homedir()`, which reads `USERPROFILE`.
 Keep the forward slash after the tilde: `~\.local\share\...` is not expanded.

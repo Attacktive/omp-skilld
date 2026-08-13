@@ -3,17 +3,19 @@
  * omp takes the extension module's default export as the factory, so the plugin file gets exactly one export and no more; helpers live here to keep that file loadable and testable.
  */
 
+import { getPluginSettings } from '@oh-my-pi/pi-coding-agent/extensibility/plugins/loader';
+import { parseFrontmatter } from '@oh-my-pi/pi-utils';
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, statSync, symlinkSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, dirname, join, sep } from 'node:path';
+import { basename, dirname, join, resolve, sep } from 'node:path';
 
 const DEFAULT_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
 /**
- * A floor on every toast, not just the first: a spawn failure lands within milliseconds, and its error toast would otherwise be the one nobody ever sees.
- * A toast fired while the TUI is still coming up goes nowhere.
+ * How long a refresh gets to settle before the "in the background" announcement fires.
+ * A spawn failure lands within milliseconds, and cancelling the announcement lets that error speak alone instead of arriving after a promise it already broke.
  */
-const TOAST_DELAY_MS = 3333;
+const ANNOUNCEMENT_DELAY_MS = 3333;
 
 /**
  * How long a download that has stopped touching its staging directory is given before it is taken for dead.
@@ -77,6 +79,15 @@ interface NormalizedSource {
 
 const slugify = (repo: string) => repo.replace(/\//g, '-');
 
+/** What went wrong, in the one form a log line can carry. */
+const reason = (cause: unknown) => {
+	if (cause instanceof Error) {
+		return cause.message;
+	}
+
+	return String(cause);
+};
+
 /** `~` is a shell convention and nothing here goes through a shell, so an unexpanded path would become a directory literally named `~`. */
 const expand = (path: string) => {
 	if (path === '~') {
@@ -120,7 +131,8 @@ const asInterval = (interval: unknown): number | undefined => {
 		return DEFAULT_INTERVAL_MS;
 	}
 
-	if (typeof interval === 'number' && Number.isFinite(interval)) {
+	// Zero is the documented refresh-every-launch; below that is nothing the manifest's `min: 0` means, and the manifest is not enforced.
+	if (typeof interval === 'number' && Number.isFinite(interval) && interval >= 0) {
 		return interval;
 	}
 
@@ -229,9 +241,10 @@ const normalize = (source: SkillSource, root: string): NormalizedSource => {
 	/*
 	 * One directory per source, and the stamp hidden beside that directory rather than inside it: the target is what omp is pointed at, so everything this plugin keeps for its own bookkeeping stays out of it.
 	 * Both are overridable per source, which is what a machine sharing a download with another tool overrides.
+	 * Resolved, because a hand-written override drags in trailing slashes and dot segments, and everything downstream — the ownership check on published links above all — compares these paths as strings.
 	 */
-	const target = expand(configured.target ?? join(root, slug));
-	const stamp = expand(configured.stamp ?? join(root, `.${slug}-refreshed`));
+	const target = resolve(expand(configured.target ?? join(root, slug)));
+	const stamp = resolve(expand(configured.stamp ?? join(root, `.${slug}-refreshed`)));
 
 	return {
 		repo: configured.repo,
@@ -253,16 +266,25 @@ const isStale = (stamp: string, interval: number) => {
 	}
 };
 
+/** The file's mtime, or `undefined` for one that vanished between the caller's `existsSync` and this read — the race a concurrent launch makes routine. */
+const mtimeMs = (path: string): number | undefined => {
+	try {
+		return statSync(path).mtimeMs;
+	} catch {
+		return undefined;
+	}
+};
+
 /**
  * Where a download is assembled before it stands in for the live directory, and where the live one is parked while they trade places.
  * Siblings of `target` rather than anything under `os.tmpdir()`, because a rename across filesystems fails with `EXDEV` and the copy it would take instead is not atomic.
  * Hidden, so a scan of the parent directory cannot mistake them for skills.
- * The markers record how a detached download ended, so a launch that missed its exit handler can tell a finished download from a failed one.
+ * The markers record how a detached download ended, so a launch that missed its exit handler can tell a finished download from a failed one; the pid marker records who is downloading, so a live one is never mistaken for debris.
  */
 const staging = (target: string) => {
 	const hidden = `${dirname(target)}/.${basename(target)}`;
 
-	return { incoming: `${hidden}.incoming`, outgoing: `${hidden}.outgoing`, done: `${hidden}.done`, failed: `${hidden}.failed` };
+	return { incoming: `${hidden}.incoming`, outgoing: `${hidden}.outgoing`, done: `${hidden}.done`, failed: `${hidden}.failed`, pid: `${hidden}.pid` };
 };
 
 /** Single-quoted for the shell that wraps `gh`, with any quote in the text closed, escaped and reopened the way `sh` requires. */
@@ -312,6 +334,29 @@ const swap = (target: string) => {
 	}
 };
 
+/**
+ * Settles the parked directory an earlier launch left behind: discarded when a live directory stands, stood back in when none does.
+ * A launch killed between {@link swap}'s two renames leaves `target` missing and `outgoing` holding the only copy of the previous skills — deleting that copy would finish the data loss the failed swap started, so it is restored instead.
+ * Returns whether it restored, since that is worth a log line and the common case is not.
+ */
+const settleParked = (target: string): boolean => {
+	const { outgoing } = staging(target);
+
+	if (!existsSync(outgoing)) {
+		return false;
+	}
+
+	if (!existsSync(target)) {
+		renameSync(outgoing, target);
+
+		return true;
+	}
+
+	rmSync(outgoing, { recursive: true, force: true });
+
+	return false;
+};
+
 /** Distinguishes a first launch, where `target` is missing outright, from a merely dated one. */
 const isEmpty = (target: string) => {
 	try {
@@ -323,7 +368,8 @@ const isEmpty = (target: string) => {
 
 /**
  * Deletes the placeholder skill a template repository ships, and only that: the directory has to still describe itself the way the template does.
- * A repository that ships a real skill under the same name keeps it, and a directory that is no skill at all — no `SKILL.md` — is left alone rather than guessed about.
+ * "Describe itself" means the frontmatter `description` — what the skill says about itself — and never the body, where a legitimate skill is free to quote the template's phrasing at whatever length.
+ * A repository that ships a real skill under the same name keeps it, and a directory that is no skill at all — no `SKILL.md`, no description — is left alone rather than guessed about.
  */
 const dropPlaceholder = (incoming: string, placeholder: string | false) => {
 	if (placeholder === false) {
@@ -332,15 +378,16 @@ const dropPlaceholder = (incoming: string, placeholder: string | false) => {
 
 	const candidate = join(incoming, placeholder);
 
-	let description: string;
+	let description: unknown;
 
 	try {
-		description = readFileSync(join(candidate, 'SKILL.md'), 'utf8').slice(0, 2048);
+		// The host's own frontmatter parser, silenced: a plugin has no business printing warnings about somebody else's SKILL.md.
+		({ frontmatter: { description } } = parseFrontmatter(readFileSync(join(candidate, 'SKILL.md'), 'utf8'), { level: 'off' }));
 	} catch {
 		return false;
 	}
 
-	if (!PLACEHOLDER_DESCRIPTION.test(description)) {
+	if (typeof description !== 'string' || !PLACEHOLDER_DESCRIPTION.test(description)) {
 		return false;
 	}
 
@@ -364,8 +411,17 @@ const claim = (link: string, target: string) => {
 	}
 
 	try {
-		// Where the link points, not where it resolves: a link left dangling by a skill that went away is still one this plugin wrote, and is the only kind it may remove.
-		return readlinkSync(link).startsWith(`${target}${sep}`) ? 'ours' : 'theirs';
+		/*
+		 * Where the link points, not where it resolves: a link left dangling by a skill that went away is still one this plugin wrote, and is the only kind it may remove.
+		 * Both sides straightened before comparing, since this is a string comparison: a junction reads back with Windows' `\\?\` device prefix and a trailing separator, and a target may arrive spelled however the user spelled it.
+		 */
+		const held = resolve(readlinkSync(link).replace(/^\\\\\?\\/, ''));
+
+		if (held.startsWith(`${resolve(target)}${sep}`)) {
+			return 'ours';
+		}
+
+		return 'theirs';
 	} catch {
 		return 'theirs';
 	}
@@ -397,7 +453,13 @@ const linkSkills = (target: string, linkRoot: string) => {
 	sweepLinks(target, linkRoot);
 
 	// A junction is what Windows gives for a directory without asking for privileges.
-	const kind = process.platform === 'win32' ? 'junction' : 'dir';
+	let kind: 'junction' | 'dir';
+
+	if (process.platform === 'win32') {
+		kind = 'junction';
+	} else {
+		kind = 'dir';
+	}
 
 	const linked: string[] = [];
 	const refused: string[] = [];
@@ -423,6 +485,76 @@ const linkSkills = (target: string, linkRoot: string) => {
 	return { linked, refused };
 };
 
+/**
+ * Whether the process a pid marker records is still running: `true` and `false` are answers, `undefined` is a marker that answers nothing — absent, unreadable, or holding no pid.
+ * `EPERM` counts as running: the pid exists but is not ours to signal — a recycled pid, say — and a false "dead" costs a live download, where a false "alive" only costs waiting out the mtime clock.
+ */
+const isDownloadAlive = (pidFile: string): boolean | undefined => {
+	let pid: number;
+
+	try {
+		pid = Number.parseInt(readFileSync(pidFile, 'utf8').trim(), 10);
+	} catch {
+		return undefined;
+	}
+
+	if (!Number.isInteger(pid) || pid <= 0) {
+		return undefined;
+	}
+
+	try {
+		// Signal 0 delivers nothing; it only asks whether there is anyone to deliver to.
+		process.kill(pid, 0);
+
+		return true;
+	} catch (cause) {
+		if ((cause as NodeJS.ErrnoException).code === 'EPERM') {
+			return true;
+		}
+
+		return false;
+	}
+};
+
+/**
+ * The last time anything landed in the download, not just in its root: a directory's mtime moves when entries appear in it, so the root goes quiet once every skill directory exists while `gh` is still filling them.
+ */
+const newestMtime = (incoming: string): number => {
+	// A download swept from under this read counts as ancient, which sends the caller down the same sweep.
+	let newest = mtimeMs(incoming) ?? 0;
+
+	let entries;
+
+	try {
+		entries = readdirSync(incoming, { withFileTypes: true });
+	} catch {
+		return newest;
+	}
+
+	for (const entry of entries) {
+		if (entry.isDirectory()) {
+			newest = Math.max(newest, mtimeMs(join(incoming, entry.name)) ?? 0);
+		}
+	}
+
+	return newest;
+};
+
+/**
+ * Whether the download owning `incoming` is still running.
+ * The process is the first word: a pid marker whose process is alive protects a download however quiet its directory, and one whose process is gone frees the directory without waiting out the clock.
+ * The mtimes decide only when there is no pid to ask — a download from before the marker existed, or a marker that would not write.
+ */
+const isInFlight = (incoming: string, pid: string): boolean => {
+	const alive = isDownloadAlive(pid);
+
+	if (alive !== undefined) {
+		return alive;
+	}
+
+	return Date.now() - newestMtime(incoming) <= ABANDONED_MS;
+};
+
 /** What an earlier launch's staging area leaves for this one to do. */
 type StagingState = 'finish' | 'failed' | 'cooling' | 'in-flight' | 'skip';
 
@@ -431,7 +563,7 @@ type StagingState = 'finish' | 'failed' | 'cooling' | 'in-flight' | 'skip';
  * The markers are what a launch that quit before its download did leaves behind, so the next one can finish the job instead of paying for the download again.
  */
 const resolveStaging = (target: string, stamp: string, staleAfter: number): StagingState => {
-	const { incoming, done, failed } = staging(target);
+	const { incoming, done, failed, pid } = staging(target);
 
 	if (existsSync(done)) {
 		// Standing a finished download in beats downloading it again; a stamp that is still fresh makes the marker moot, since the refresh it records already happened.
@@ -439,7 +571,10 @@ const resolveStaging = (target: string, stamp: string, staleAfter: number): Stag
 			return 'finish';
 		}
 
+		// The download goes with its marker: nothing can install it any more, and left behind it would read as still running to the next stale launch.
 		rmSync(done, { force: true });
+		rmSync(incoming, { recursive: true, force: true });
+		rmSync(pid, { force: true });
 
 		return 'skip';
 	}
@@ -448,13 +583,17 @@ const resolveStaging = (target: string, stamp: string, staleAfter: number): Stag
 		/*
 		 * A download fails for reasons a second attempt rarely fixes within the same minute: no login, no network, a rate limit that has already been spent.
 		 * The marker doubles as the cooldown, so a launch loop cannot turn one failure into an attempt per launch.
+		 * A marker gone by the time it is read was another launch's doing, and falls through to the sweep that launch has begun anyway.
 		 */
-		if (Date.now() - statSync(failed).mtimeMs <= FAILURE_COOLDOWN_MS) {
+		const recorded = mtimeMs(failed);
+
+		if (recorded !== undefined && Date.now() - recorded <= FAILURE_COOLDOWN_MS) {
 			return 'cooling';
 		}
 
 		rmSync(failed, { force: true });
 		rmSync(incoming, { recursive: true, force: true });
+		rmSync(pid, { force: true });
 
 		return 'failed';
 	}
@@ -464,112 +603,35 @@ const resolveStaging = (target: string, stamp: string, staleAfter: number): Stag
 		 * A download still running owns the directory and is left alone — yanking it would cost the whole download again, and `gh` would write the rest of it into a directory that is no longer there.
 		 * Deliberately not measured against the refresh interval: a short interval must not condemn a download that is merely still going, and a long one must not leave a hard-killed launch's debris sitting in front of a fresh start for a day.
 		 */
-		if (Date.now() - statSync(incoming).mtimeMs <= ABANDONED_MS) {
+		if (isInFlight(incoming, pid)) {
 			return 'in-flight';
 		}
 
 		rmSync(incoming, { recursive: true, force: true });
 	}
 
+	rmSync(pid, { force: true });
+
 	return 'skip';
 };
 
-/** The extension factory runs once per session (subagents included); the sweep must run once per launch. Tests reset `.done` between cases. */
-export const sweepGuard = { done: false };
+/**
+ * The extension factory runs once per session (subagents included); the sweep must run once per launch.
+ * `settled` is the running sweep's promise — nothing in production awaits it, but the tests do, since the settings read behind it is genuinely asynchronous. Tests reset `.done` between cases.
+ */
+export const sweepGuard: { done: boolean; settled?: Promise<void> } = { done: false };
 
 /**
- * The bases omp looks in for a project-local override, in the order it tries them.
- * It reads other agents' directories too, so a project that configures omp through `.claude` is honoured the same way omp itself honours it.
+ * Read this plugin's settings the way omp itself reads them, by asking omp: the host resolves the lock under its own directory layout — the XDG migration included — and merges in the project-local `plugin-overrides.json` it finds at `cwd`, the project winning.
+ * A hand-rolled copy of that resolution is what this replaces, because a copy drifts, and drift here means reading a lock omp never writes — a plugin that is configured yet silently inert.
+ * A project override that will not parse is skipped by the host the way omp skips it everywhere; a lock that will not parse is an error, so the user hears why nothing refreshes.
  */
-const OVERRIDE_BASES = ['.omp', '.claude', '.codex', '.gemini'];
-
-/** Every project-local override path omp would consider, nearest first: each base at `cwd`, then the same bases at every ancestor. */
-const overrideCandidates = (cwd: string) => {
-	const candidates: string[] = [];
-
-	let directory = cwd;
-
-	for (;;) {
-		candidates.push(...OVERRIDE_BASES.map((base) => join(directory, base, 'plugin-overrides.json')));
-
-		const parent = dirname(directory);
-
-		if (parent === directory) {
-			return candidates;
-		}
-
-		directory = parent;
+const readPluginSettings = async (cwd: string): Promise<{ options: Record<string, unknown>; error?: string }> => {
+	try {
+		return { options: await getPluginSettings(PLUGIN_NAME, cwd) };
+	} catch (cause) {
+		return { options: {}, error: reason(cause) };
 	}
 };
 
-/**
- * The lock omp keeps this plugin's settings in.
- * It lives under `<ompRoot>/plugins`, which is the agent directory's parent in every layout omp resolves — the XDG data root included, since the agent directory moves there with it.
- * The exception is an agent directory pointed elsewhere by `PI_CODING_AGENT_DIR`, which leaves the plugins where they were.
- */
-const lockPath = (agentDir: string) => {
-	const xdgDataHome = process.env.XDG_DATA_HOME;
-
-	const candidates: string[] = [];
-
-	if (xdgDataHome !== undefined && existsSync(join(xdgDataHome, 'omp', 'agent'))) {
-		candidates.push(join(xdgDataHome, 'omp', 'plugins', 'omp-plugins.lock.json'));
-	}
-
-	candidates.push(join(dirname(agentDir), 'plugins', 'omp-plugins.lock.json'));
-
-	if (process.env.PI_CODING_AGENT_DIR !== undefined && !agentDir.startsWith(join(homedir(), '.omp'))) {
-		candidates.push(join(homedir(), '.omp', 'plugins', 'omp-plugins.lock.json'));
-	}
-
-	// First match wins; with none of them there, the first is the one whose absence means "not configured".
-	return candidates.find((candidate) => existsSync(candidate)) ?? candidates[0] ?? '';
-};
-
-/**
- * Read this plugin's settings the way omp persists them: `omp-plugins.lock.json` under the plugins dir, merged with the nearest project-local `plugin-overrides.json` — the project wins.
- * The override is searched for the way omp searches — every `.omp`, `.claude`, `.codex` and `.gemini` from `cwd` up to the root, nearest first, and the first one that parses is the one that counts.
- * A file that is not there is not an error (defaults say no-op); one that will not parse is, so the user hears why nothing refreshes.
- */
-const readPluginSettings = async (agentDir: string, cwd: string): Promise<{ options: Record<string, unknown>; error?: string }> => {
-	let options: Record<string, unknown> = {};
-	let error: string | undefined;
-
-	const read = (path: string) => {
-		if (!existsSync(path)) {
-			return;
-		}
-
-		try {
-			const parsed = JSON.parse(readFileSync(path, 'utf8')) as { settings?: Record<string, Record<string, unknown>> };
-
-			options = { ...options, ...(parsed.settings?.[PLUGIN_NAME] ?? {}) };
-		} catch (cause) {
-			error ??= `${path}: ${cause instanceof Error ? cause.message : String(cause)}`;
-		}
-	};
-
-	read(lockPath(agentDir));
-
-	/*
-	 * Only the nearest override that parses applies, which is what omp does with them.
-	 * A malformed one nearer than that is skipped rather than fatal — again omp's behaviour — but it is still reported, since a project override that silently does nothing is the hardest kind of configuration to debug.
-	 */
-	for (const candidate of overrideCandidates(cwd)) {
-		if (!existsSync(candidate)) {
-			continue;
-		}
-
-		const before = error;
-
-		read(candidate);
-
-		if (error === before) {
-			break;
-		}
-	}
-
-	return error === undefined ? { options } : { options, error };
-};
-
-export { DEFAULT_INTERVAL_MS, TOAST_DELAY_MS, DEFAULT_PLACEHOLDER, ABANDONED_MS, FAILURE_COOLDOWN_MS, NOT_FOUND, NOT_EXECUTABLE, PLUGIN_NAME, type SkillRepository, type SkillSource, type Options, type NormalizedSource, type StagingState, type Layout, slugify, expand, asInterval, asPlaceholder, asSources, isRepo, isSource, layout, normalize, staging, installCommand, swap, isStale, isEmpty, dropPlaceholder, linkSkills, resolveStaging, readPluginSettings };
+export { DEFAULT_INTERVAL_MS, ANNOUNCEMENT_DELAY_MS, DEFAULT_PLACEHOLDER, ABANDONED_MS, FAILURE_COOLDOWN_MS, NOT_FOUND, NOT_EXECUTABLE, PLUGIN_NAME, type SkillRepository, type SkillSource, type Options, type NormalizedSource, type StagingState, type Layout, slugify, reason, expand, asInterval, asPlaceholder, asSources, isRepo, isSource, layout, normalize, staging, installCommand, settleParked, swap, isStale, isEmpty, dropPlaceholder, linkSkills, resolveStaging, readPluginSettings };

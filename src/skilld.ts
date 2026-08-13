@@ -12,7 +12,7 @@ import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { DEFAULT_INTERVAL_MS, NOT_EXECUTABLE, NOT_FOUND, PLUGIN_NAME, TOAST_DELAY_MS, asInterval, asSources, dropPlaceholder, installCommand, isEmpty, isSource, isStale, layout, linkSkills, normalize, readPluginSettings, resolveStaging, staging, swap, sweepGuard, type Layout, type NormalizedSource, type Options, type SkillSource, type StagingState } from './internals.ts';
+import { ANNOUNCEMENT_DELAY_MS, DEFAULT_INTERVAL_MS, NOT_EXECUTABLE, NOT_FOUND, PLUGIN_NAME, asInterval, reason, asSources, dropPlaceholder, installCommand, isEmpty, isSource, isStale, layout, linkSkills, normalize, readPluginSettings, resolveStaging, settleParked, staging, swap, sweepGuard, type Layout, type NormalizedSource, type Options, type SkillSource, type StagingState } from './internals.ts';
 
 /** Exhaustive against {@link Options} by construction: a key added there refuses to compile until it is mirrored here. */
 const KNOWN_OPTIONS: Record<keyof Options, null> = { sources: null, interval: null };
@@ -23,27 +23,34 @@ type Toast = (message: string, variant: 'info' | 'warning' | 'error') => void;
 /** Where a refresh says what it did regardless of whether anyone is looking: toasts need a TUI, and the launches that need explaining most — `omp -p`, a CI run — have none. */
 type Log = (message: string) => void;
 
-/** What went wrong, in the one form a log line can carry. */
-const reason = (cause: unknown) => {
-	if (cause instanceof Error) {
-		return cause.message;
-	}
-
-	return String(cause);
-};
-
 /**
  * Starts the download and leaves it running.
  * Detached so it survives omp quitting: omp takes its process group with it, and a refresh that dies mid-download restarts from scratch on every launch — expensive against the skill API's rate limit.
  * A shell wraps `gh` only so that something which outlives this process can record how the download ended; the plugin's own handlers die with the parent.
  * Windows does not reap children with their parent, so there `gh` is spawned directly and the markers are the launch's own business.
  */
-const download = (repo: string, incoming: string, done: string, failed: string) => {
+const download = (repo: string, incoming: string, done: string, failed: string, pid: string) => {
+	let child;
+
 	if (process.platform === 'win32') {
-		return spawn('gh', ['skill', 'install', repo, '--all', '--dir', incoming, '--force'], { stdio: 'ignore', detached: true });
+		child = spawn('gh', ['skill', 'install', repo, '--all', '--dir', incoming, '--force'], { stdio: 'ignore', detached: true });
+	} else {
+		child = spawn('sh', ['-c', installCommand(repo, incoming, done, failed)], { stdio: 'ignore', detached: true });
 	}
 
-	return spawn('sh', ['-c', installCommand(repo, incoming, done, failed)], { stdio: 'ignore', detached: true });
+	/*
+	 * Who is downloading, for the launches that come while it still is: a live pid protects a quiet download from the abandonment sweep, and a dead one frees the staging area without waiting out the clock.
+	 * A marker that would not write is no failure — the mtime fallback still speaks.
+	 */
+	if (child.pid !== undefined) {
+		try {
+			writeFileSync(pid, String(child.pid));
+		} catch {
+			// The mtime fallback still speaks.
+		}
+	}
+
+	return child;
 };
 
 /**
@@ -72,19 +79,17 @@ const publish = (source: NormalizedSource, linkRoot: string, toast: Toast, log: 
 /** A finished download becomes the live directory, its stamp is recorded, and the completion markers make way for the next refresh. Shared by the in-process exit handler and the launch that finds a finished download left behind by a dead one. */
 const complete = (source: NormalizedSource, dirs: Layout, toast: Toast, log: Log) => {
 	const { target, stamp } = source;
-	const { incoming, done, failed } = staging(target);
+	const { incoming, done, failed, pid } = staging(target);
 
 	/*
 	 * Unlinking the marker is how a launch claims the download: two started close enough together both find it finished, and only one unlink can succeed.
-	 * The loser bows out instead of racing the winner's swap and reporting an install failure that never happened.
+	 * Everyone who calls this holds a marker — the exit handler writes one before calling, every platform included — so a marker already gone means the claim is lost, and the loser bows out instead of racing the winner's swap and reporting an install failure that never happened.
 	 */
-	if (existsSync(done)) {
-		try {
-			rmSync(done);
-		} catch {
-			log(`${source.label}: another launch is installing this download`);
-			return;
-		}
+	try {
+		rmSync(done);
+	} catch {
+		log(`${source.label}: another launch is installing this download`);
+		return;
 	}
 
 	const first = isEmpty(target);
@@ -97,6 +102,18 @@ const complete = (source: NormalizedSource, dirs: Layout, toast: Toast, log: Log
 		// The download becomes the live directory only once it is whole, so nothing ever scans a half-written one.
 		swap(target);
 	} catch (cause) {
+		/*
+		 * A download that is still whole gets its claim back, so the next launch retries the install instead of paying for the download again.
+		 * Only then: re-arming a marker with nothing behind it would loop the same failure once per launch forever.
+		 */
+		if (existsSync(incoming)) {
+			try {
+				writeFileSync(done, '');
+			} catch {
+				// The next launch downloads again instead, which is the cost this marker exists to avoid — not a new failure.
+			}
+		}
+
 		log(`${source.label}: could not install the download: ${reason(cause)}`);
 		toast(`Downloaded ${source.label}, but could not install it — the skills you already had are untouched.`, 'error');
 		return;
@@ -114,6 +131,7 @@ const complete = (source: NormalizedSource, dirs: Layout, toast: Toast, log: Log
 	}
 
 	rmSync(failed, { force: true });
+	rmSync(pid, { force: true });
 
 	publish(source, dirs.linkRoot, toast, log);
 
@@ -169,11 +187,7 @@ const refresh = (configured: SkillSource, dirs: Layout, staleAfter: number, toas
 		label = source.label;
 
 		const { repo, target, stamp } = source;
-		const { incoming, outgoing, done, failed } = staging(target);
-
-		if (existsSync(target)) {
-			publish(source, dirs.linkRoot, toast, log);
-		}
+		const { incoming, done, failed, pid } = staging(target);
 
 		/*
 		 * Only the parent, which is where staging goes.
@@ -181,8 +195,17 @@ const refresh = (configured: SkillSource, dirs: Layout, staleAfter: number, toas
 		 */
 		mkdirSync(dirname(target), { recursive: true });
 
-		// A parked directory can never be swapped in by the launch that parked it — that handler died with the parent — so discarding it is always correct.
-		rmSync(outgoing, { recursive: true, force: true });
+		/*
+		 * A parked directory can never be swapped in by the launch that parked it — that handler died with the parent — so it is settled here: discarded when the live directory stands, stood back in when a swap died between its two renames and the park is the only copy of the skills left.
+		 * Before publication, so skills recovered this way are linked on the same launch that recovers them.
+		 */
+		if (settleParked(target)) {
+			log(`${label}: restored the skills a failed swap left parked`);
+		}
+
+		if (existsSync(target)) {
+			publish(source, dirs.linkRoot, toast, log);
+		}
 
 		if (!proceed(resolveStaging(target, stamp, staleAfter), source, dirs, toast, log)) {
 			return;
@@ -204,15 +227,19 @@ const refresh = (configured: SkillSource, dirs: Layout, staleAfter: number, toas
 		/*
 		 * Cancelled the moment the refresh settles: one that beats the TUI to it would otherwise promise a second message it has already sent, and a missing `gh` — which fails within milliseconds — would announce a download that never started.
 		 */
-		notice = ctx.setTimeout(() => toast(announcement, 'info'), TOAST_DELAY_MS);
+		notice = ctx.setTimeout(() => toast(announcement, 'info'), ANNOUNCEMENT_DELAY_MS);
 
-		const install = download(repo, incoming, done, failed);
+		const install = download(repo, incoming, done, failed, pid);
 
 		log(`${label}: downloading into ${incoming}`);
 
 		// Node warns that `exit` may or may not follow `error`, so whichever fires first speaks for the child.
 		let settled = false;
 
+		/*
+		 * Runs as a bare listener on the child, where an exception that escapes becomes omp's postmortem — the whole session dying over a marker that would not delete.
+		 * Hence the guarded steps: no failure among them may rob the others, and none may escape.
+		 */
 		const finish = (speak: () => void) => {
 			if (settled) {
 				return;
@@ -220,11 +247,26 @@ const refresh = (configured: SkillSource, dirs: Layout, staleAfter: number, toas
 
 			settled = true;
 
-			if (notice !== undefined) {
-				ctx.clearTimer(notice);
+			try {
+				// The child is gone whichever way this was reached, so the liveness marker goes with it.
+				rmSync(pid, { force: true });
+			} catch {
+				// A marker that will not delete reads as a dead pid to the next launch, which draws the same conclusion.
 			}
 
-			speak();
+			try {
+				if (notice !== undefined) {
+					ctx.clearTimer(notice);
+				}
+			} catch {
+				// A session torn down mid-download has no timers left to clear.
+			}
+
+			try {
+				speak();
+			} catch (cause) {
+				log(`${label}: ${reason(cause)}`);
+			}
 		};
 
 		/** Every way a download that did start can fail: the log gets the detail, the toast gets the same detail in parentheses. */
@@ -250,7 +292,15 @@ const refresh = (configured: SkillSource, dirs: Layout, staleAfter: number, toas
 
 		const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
 			if (signal !== null) {
-				finish(speakOnFailure(`\`gh\` was killed by ${signal}`));
+				const speak = speakOnFailure(`\`gh\` was killed by ${signal}`);
+
+				finish(() => {
+					// A killed download leaves a half-written directory nothing will ever finish; sweeping it now spares the next launch the abandonment clock.
+					rmSync(incoming, { recursive: true, force: true });
+
+					speak();
+				});
+
 				return;
 			}
 
@@ -261,12 +311,30 @@ const refresh = (configured: SkillSource, dirs: Layout, staleAfter: number, toas
 			}
 
 			if (code !== 0) {
-				finish(speakOnFailure(`\`gh\` exited with code ${code}`));
+				const speak = speakOnFailure(`\`gh\` exited with code ${code}`);
+
+				finish(() => {
+					/*
+					 * Windows parity for the cooldown: the wrapper writes this marker everywhere the download goes through `sh`, but a `gh` spawned bare records nothing, and an expired login would otherwise cost an attempt per launch.
+					 * Everywhere else it is already on disk, and rewriting it only freshens the mtime the cooldown reads.
+					 */
+					writeFileSync(failed, '');
+
+					speak();
+				});
+
 				return;
 			}
 
-			// In-process fast path for a launch that lives to see it; the marker left behind lets a later launch finish the job.
-			finish(() => complete(source, dirs, toast, log));
+			/*
+			 * In-process fast path for a launch that lives to see it; the marker left behind lets a later launch finish the job.
+			 * Written here as well as by the wrapper, because on Windows this is the only writer there is — and the claim inside `complete` expects every caller to hold one.
+			 */
+			finish(() => {
+				writeFileSync(done, '');
+
+				complete(source, dirs, toast, log);
+			});
 		};
 
 		install.on('error', onError);
@@ -288,7 +356,7 @@ const refresh = (configured: SkillSource, dirs: Layout, staleAfter: number, toas
 };
 
 const sweep = async (agentDir: string, cwd: string, toast: Toast, log: Log, ctx: ExtensionContext) => {
-	const { options: given, error } = await readPluginSettings(agentDir, cwd);
+	const { options: given, error } = await readPluginSettings(cwd);
 
 	if (error !== undefined) {
 		log(`could not read the settings: ${error}`);
@@ -296,8 +364,9 @@ const sweep = async (agentDir: string, cwd: string, toast: Toast, log: Log, ctx:
 		return;
 	}
 
-	// A typo'd key would otherwise make the plugin indistinguishable from one that was never configured.
-	const strangers = Object.keys(given).filter((key) => !(key in KNOWN_OPTIONS));
+	// A typo'd key would otherwise make the plugin indistinguishable from one that was never configured. Own properties only, or a key like `toString` would slip through by inheritance.
+	const strangers = Object.keys(given)
+		.filter((key) => !Object.hasOwn(KNOWN_OPTIONS, key));
 
 	if (strangers.length > 0) {
 		toast(`Ignoring unknown options: ${strangers.map((stranger) => `\`${stranger}\``).join(', ')}. The options are \`sources\` and \`interval\`.`, 'error');
@@ -343,8 +412,6 @@ const plugin = (pi: ExtensionAPI): void => {
 
 		sweepGuard.done = true;
 
-		const started = Date.now();
-
 		let agentDir: string;
 
 		try {
@@ -362,26 +429,19 @@ const plugin = (pi: ExtensionAPI): void => {
 		};
 
 		/*
-		 * Held back until the TUI can be listening: extensions are loaded before it attaches, and until it does `ctx.ui` is a set of no-ops, so a toast sent early is not delayed but lost.
-		 * Everything past that floor goes out as it happens, and the log has the whole story either way.
+		 * Straight through: `ctx.ui` is wired before `session_start` is emitted in every omp mode — the real UI when there is one, a permanent no-op when there is not (`ctx.hasUI` says which) — so holding a toast back buys nothing and would only delay every error by the hold.
+		 * Headless launches still get the whole story through the log.
 		 */
 		const toast: Toast = (message, variant) => {
-			const held = ctx.setTimeout(
-				() => {
-					try {
-						ctx.ui.notify(message, variant);
-					} catch {
-						// The session may have ended while the refresh was still running; there is nowhere left to say it.
-					}
-				},
-				Math.max(0, TOAST_DELAY_MS - (Date.now() - started))
-			);
-
-			// A pending toast must never be what keeps omp from exiting.
-			held.unref?.();
+			try {
+				ctx.ui.notify(message, variant);
+			} catch {
+				// The session may have ended while the refresh was still running; there is nowhere left to say it.
+			}
 		};
 
-		void sweep(agentDir, ctx.cwd, toast, log, ctx);
+		// Recorded rather than awaited: the launch never waits on the sweep, but the tests need to.
+		sweepGuard.settled = sweep(agentDir, ctx.cwd, toast, log, ctx);
 	});
 };
 

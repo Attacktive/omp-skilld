@@ -1,4 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from '@oh-my-pi/pi-coding-agent';
+import { refreshDirsFromEnv } from '@oh-my-pi/pi-utils';
 import { afterAll, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readlinkSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
@@ -6,7 +7,7 @@ import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import * as pluginModule from './skilld.ts';
 import plugin from './skilld.ts';
-import { ABANDONED_MS, DEFAULT_INTERVAL_MS, FAILURE_COOLDOWN_MS, NOT_EXECUTABLE, NOT_FOUND, PLUGIN_NAME, asInterval, asPlaceholder, asSources, dropPlaceholder, expand, installCommand, isEmpty, isRepo, isSource, isStale, layout, linkSkills, normalize, readPluginSettings, resolveStaging, slugify, staging, swap, sweepGuard } from './internals.ts';
+import { ABANDONED_MS, DEFAULT_INTERVAL_MS, FAILURE_COOLDOWN_MS, NOT_EXECUTABLE, NOT_FOUND, PLUGIN_NAME, asInterval, asPlaceholder, asSources, dropPlaceholder, expand, installCommand, isEmpty, isRepo, isSource, isStale, layout, linkSkills, normalize, readPluginSettings, resolveStaging, settleParked, slugify, staging, swap, sweepGuard } from './internals.ts';
 
 const INTERVAL_MS = 24 * 60 * 60 * 1000;
 
@@ -19,6 +20,24 @@ interface PendingToast {
 const scratch = mkdtempSync(join(tmpdir(), 'skilld-'));
 
 afterAll(() => rmSync(scratch, { recursive: true, force: true }));
+
+/*
+ * The host resolves the plugins lock through its XDG-aware directory layout, so the tests point XDG at the scratch to stay off the real `~/.omp`.
+ * The resolver freezes its environment when `pi-utils` loads, hence the rebuild once the variables are in place — and `$XDG_DATA_HOME/omp` has to exist for the redirect to engage, the same bar `omp config init-xdg` sets.
+ */
+process.env.XDG_DATA_HOME = join(scratch, 'xdg');
+delete process.env.PI_CODING_AGENT_DIR;
+mkdirSync(join(scratch, 'xdg', 'omp'), { recursive: true });
+refreshDirsFromEnv();
+
+/** The lock omp itself would read and write under the XDG layout above. */
+const lockFile = join(scratch, 'xdg', 'omp', 'plugins', 'omp-plugins.lock.json');
+
+/** Writes this plugin's settings into the lock the way omp persists them. */
+const writeLock = (settings: unknown) => {
+	mkdirSync(dirname(lockFile), { recursive: true });
+	writeFileSync(lockFile, JSON.stringify({ settings: { [PLUGIN_NAME]: settings } }));
+};
 
 interface HeardToast {
 	message: string;
@@ -45,8 +64,8 @@ const listener = () => {
 	} as unknown as ExtensionAPI;
 
 	/*
-	 * Every toast the plugin sends is held behind `ctx.setTimeout`, since omp's UI is a set of no-ops until the TUI attaches.
-	 * The queue is the plugin's, not the clock's, so the tests drain it instead of waiting `TOAST_DELAY_MS` out in real time.
+	 * Toasts go straight to `ctx.ui.notify` and land in `heard` as they happen; only the "in the background" announcement sits behind `ctx.setTimeout`.
+	 * The queue is the plugin's, not the clock's, so the tests drain it instead of waiting `ANNOUNCEMENT_DELAY_MS` out in real time.
 	 */
 	const pending = new Map<object, PendingToast>();
 
@@ -85,27 +104,68 @@ const listener = () => {
 		}
 	};
 
-	/** `session_start` starts the sweep without awaiting it; this is where its settings read lands, without pinning anything to the clock. */
-	const settle = () => new Promise<void>((resolve) => void setImmediate(resolve));
+	/** Waits for a real, detached download to reach `condition`, flushing whatever toasts it queues along the way. Nothing here is on the plugin's clock — the downloads in these tests finish in milliseconds. */
+	const settleDownload = async (condition: () => boolean) => {
+		for (let waited = 0; waited < 5000; waited += 25) {
+			flush();
+
+			if (condition()) {
+				return;
+			}
+
+			await new Promise((resolve) => setTimeout(resolve, 25));
+		}
+	};
 
 	/** Writes the settings the way omp persists them, runs one sweep, and hands over whatever it had to say. */
 	const run = async (settings: unknown) => {
-		mkdirSync(join(scratch, 'plugins'), { recursive: true });
-		writeFileSync(join(scratch, 'plugins', 'omp-plugins.lock.json'), JSON.stringify({ settings: { [PLUGIN_NAME]: settings } }));
-
-		process.env.XDG_DATA_HOME = join(scratch, 'xdg');
+		writeLock(settings);
 
 		sweepGuard.done = false;
 
 		plugin(piStub);
 
 		await onSessionStart?.({}, ctxStub);
-		await settle();
+
+		// The launch never waits on the sweep, but a test asserting on its outcome has to; the guard holds the promise for exactly this.
+		await sweepGuard.settled;
 
 		flush();
 	};
 
-	return { heard, run };
+	return { heard, run, settleDownload };
+};
+
+/**
+ * Runs one real refresh against a fake `gh` planted on `PATH`, so the spawn, the exit handling and the install run exactly as production wires them.
+ * `PATH` holds the fake bin and nothing else — a machine's real `gh` must stay unreachable, or these tests would hit the network — so the wrapper's `sh` resolves through a link planted beside the fake, and the fake script re-arms its own `PATH` for the tools it calls.
+ */
+const refreshWith = async (name: string, gh?: string) => {
+	const home = join(scratch, name);
+	const bin = join(home, 'bin');
+	const target = join(home, 'target');
+	const stamp = join(home, 'stamp');
+
+	mkdirSync(bin, { recursive: true });
+	symlinkSync('/bin/sh', join(bin, 'sh'));
+
+	if (gh !== undefined) {
+		writeFileSync(join(bin, 'gh'), `#!/bin/sh\nPATH=/bin:/usr/bin\n${gh}`);
+		chmodSync(join(bin, 'gh'), 0o755);
+	}
+
+	const previousPath = process.env.PATH;
+	process.env.PATH = bin;
+
+	const { heard, run, settleDownload } = listener();
+
+	try {
+		await run({ sources: [{ repo: 'someone/their-skills', target, stamp, label: name }] });
+	} finally {
+		process.env.PATH = previousPath;
+	}
+
+	return { heard, settleDownload, target, stamp };
 };
 
 test(
@@ -170,6 +230,10 @@ test(
 			.toBeUndefined();
 
 		expect(asInterval(Number.POSITIVE_INFINITY))
+			.toBeUndefined();
+
+		// The manifest says `min: 0`, and nothing enforces the manifest; below zero would mean refresh-every-launch, which nobody asks for by accident twice.
+		expect(asInterval(-1))
 			.toBeUndefined();
 	}
 );
@@ -470,15 +534,42 @@ test(
 );
 
 test(
+	'normalize straightens what a hand-written path drags in, so every later comparison sees one spelling',
+	() => {
+		const source = normalize({ repo: 'someone/their-skills', target: '/skills/anthropic/', stamp: '/state/./anthropic-stamp' }, '/omp/skilld');
+
+		expect(source.target)
+			.toBe('/skills/anthropic');
+
+		expect(source.stamp)
+			.toBe('/state/anthropic-stamp');
+	}
+);
+
+test(
+	'linkSkills stays idempotent under a target spelled with a trailing slash',
+	() => {
+		const { target, linkRoot } = downloaded('link-trailing-slash', ['pdf']);
+
+		expect(linkSkills(`${target}/`, linkRoot).linked)
+			.toEqual(['pdf']);
+
+		// The second launch has to recognise its own link, not refuse it as the user's.
+		expect(linkSkills(`${target}/`, linkRoot))
+			.toEqual({ linked: [], refused: [] });
+	}
+);
+
+test(
 	'staging hides both directories beside the target, so a scan ignores them and the swap stays a rename',
 	() => expect(staging('/skills/anthropic'))
-		.toEqual({ incoming: '/skills/.anthropic.incoming', outgoing: '/skills/.anthropic.outgoing', done: '/skills/.anthropic.done', failed: '/skills/.anthropic.failed' })
+		.toEqual({ incoming: '/skills/.anthropic.incoming', outgoing: '/skills/.anthropic.outgoing', done: '/skills/.anthropic.done', failed: '/skills/.anthropic.failed', pid: '/skills/.anthropic.pid' })
 );
 
 /** A staging area as an earlier launch would have left it: the download, plus whatever marker recorded how it ended. */
 const staged = (name: string, marker?: 'done' | 'failed', age = 0) => {
 	const target = join(scratch, name);
-	const { incoming, done, failed } = staging(target);
+	const { incoming, done, failed, pid } = staging(target);
 
 	mkdirSync(join(incoming, 'a-skill'), { recursive: true });
 
@@ -493,14 +584,18 @@ const staged = (name: string, marker?: 'done' | 'failed', age = 0) => {
 	if (age > 0) {
 		const when = new Date(Date.now() - age);
 
+		// "Nothing has touched the download" means nothing anywhere in it, so the skill directory ages with its root.
 		utimesSync(incoming, when, when);
+		utimesSync(join(incoming, 'a-skill'), when, when);
 
-		if (marker !== undefined) {
-			utimesSync(marker === 'done' ? done : failed, when, when);
+		if (marker === 'done') {
+			utimesSync(done, when, when);
+		} else if (marker !== undefined) {
+			utimesSync(failed, when, when);
 		}
 	}
 
-	return { target, incoming, done, failed };
+	return { target, incoming, done, failed, pid };
 };
 
 test(
@@ -518,9 +613,9 @@ test(
 );
 
 test(
-	'resolveStaging drops the marker of a download whose refresh has already been recorded',
+	'resolveStaging sweeps a download whose refresh has already been recorded, the marker and the download together',
 	() => {
-		const { target, done } = staged('resolve-done-fresh', 'done');
+		const { target, incoming, done } = staged('resolve-done-fresh', 'done');
 
 		const stamp = join(scratch, 'resolve-done-fresh-stamp');
 		writeFileSync(stamp, '');
@@ -529,6 +624,10 @@ test(
 			.toBe('skip');
 
 		expect(existsSync(done))
+			.toBe(false);
+
+		// Left behind, the download would read as still running to the next stale launch and stall it, when nothing can ever install it.
+		expect(existsSync(incoming))
 			.toBe(false);
 	}
 );
@@ -593,6 +692,61 @@ test(
 	}
 );
 
+test(
+	'resolveStaging trusts a live process over a quiet directory, so a slow download is never swept mid-run',
+	() => {
+		const { target, incoming, pid } = staged('resolve-quiet-alive', undefined, ABANDONED_MS + 60_000);
+
+		// The test's own process stands in for a download that has gone quiet — one long file writes nothing new into the directory for as long as it takes.
+		writeFileSync(pid, String(process.pid));
+
+		expect(resolveStaging(target, join(scratch, 'never-refreshed'), INTERVAL_MS))
+			.toBe('in-flight');
+
+		expect(existsSync(incoming))
+			.toBe(true);
+	}
+);
+
+test(
+	'resolveStaging sweeps a download whose process is gone without waiting out the clock',
+	() => {
+		const { target, incoming, pid } = staged('resolve-dead');
+
+		// A process that has already exited: hard-killed mid-download, its directory still fresh.
+		const gone = spawnSync('/bin/sh', ['-c', 'exit 0']).pid;
+		writeFileSync(pid, String(gone));
+
+		expect(resolveStaging(target, join(scratch, 'never-refreshed'), INTERVAL_MS))
+			.toBe('skip');
+
+		expect(existsSync(incoming))
+			.toBe(false);
+
+		expect(existsSync(pid))
+			.toBe(false);
+	}
+);
+
+test(
+	'resolveStaging reads liveness from the whole download, since only new entries bump a directory',
+	() => {
+		const { target, incoming } = staged('resolve-deep-write', undefined, ABANDONED_MS + 60_000);
+
+		// The root went quiet once every skill directory existed, but a skill is still filling up; creating it bumped the root, so the root is aged again.
+		mkdirSync(join(incoming, 'busy-skill'), { recursive: true });
+
+		const quiet = new Date(Date.now() - ABANDONED_MS - 60_000);
+		utimesSync(incoming, quiet, quiet);
+
+		expect(resolveStaging(target, join(scratch, 'never-refreshed'), INTERVAL_MS))
+			.toBe('in-flight');
+
+		expect(existsSync(incoming))
+			.toBe(true);
+	}
+);
+
 /**
  * Runs the real wrapper with a `PATH` holding only what the case wants `gh` to be, so the markers are the shell's own doing and no `gh` installed on this machine can be reached.
  * Nothing else the command needs — `[`, `:`, the redirection — lives outside the shell, which is what makes that `PATH` enough; the shell itself is spawned by absolute path, since Node resolves the executable through the same `PATH` the case has emptied.
@@ -649,6 +803,71 @@ test(
 	() => {
 		expect(runInstall('gh-succeeded', { script: '#!/bin/sh\nexit 0\n', mode: 0o755 }))
 			.toEqual({ status: 0, done: true, failed: false });
+	}
+);
+
+test(
+	'a refresh downloads, installs, stamps and publishes end to end',
+	async () => {
+		const { heard, settleDownload, target, stamp } = await refreshWith(
+			'e2e-success',
+			'mkdir -p "$6/e2e-success-skill"\necho done > "$6/e2e-success-skill/SKILL.md"\nexit 0\n'
+		);
+
+		await settleDownload(() => existsSync(stamp));
+
+		expect(existsSync(join(target, 'e2e-success-skill', 'SKILL.md')))
+			.toBe(true);
+
+		// Published into the directory omp scans, and the staging area is spent.
+		expect(readlinkSync(join(scratch, 'agent', 'skills', 'e2e-success-skill')))
+			.toBe(join(target, 'e2e-success-skill'));
+
+		expect(existsSync(staging(target).done))
+			.toBe(false);
+
+		expect(existsSync(staging(target).incoming))
+			.toBe(false);
+
+		expect(heard.some((toast) => toast.type === 'info' && toast.message.includes('ready')))
+			.toBe(true);
+	}
+);
+
+test(
+	'a refresh whose download fails records the failure and keeps the cooldown armed',
+	async () => {
+		const { heard, settleDownload, target, stamp } = await refreshWith(
+			'e2e-failure',
+			'exit 1\n'
+		);
+
+		await settleDownload(() => existsSync(staging(target).failed));
+
+		expect(heard.some((toast) => toast.type === 'error' && toast.message.includes('exited with code 1')))
+			.toBe(true);
+
+		// Nothing to install means nothing to stand in: the target never appears, and no stamp records a refresh that did not happen.
+		expect(existsSync(target))
+			.toBe(false);
+
+		expect(existsSync(stamp))
+			.toBe(false);
+	}
+);
+
+test(
+	'a refresh with no `gh` to run says so, and arms no cooldown it never earned',
+	async () => {
+		const { heard, settleDownload, target } = await refreshWith('e2e-no-gh');
+
+		await settleDownload(() => heard.some((toast) => toast.type === 'error'));
+
+		expect(heard.some((toast) => toast.message.includes('`gh` is not installed')))
+			.toBe(true);
+
+		expect(existsSync(staging(target).failed))
+			.toBe(false);
 	}
 );
 
@@ -738,6 +957,23 @@ test(
 );
 
 test(
+	'dropPlaceholder keeps a skill that merely quotes the template phrase in its body',
+	() => {
+		const incoming = join(scratch, 'quoting-placeholder');
+		mkdirSync(join(incoming, 'template'), { recursive: true });
+
+		// Only what the skill says about itself counts; what it says about the template does not.
+		writeFileSync(join(incoming, 'template', 'SKILL.md'), '---\nname: template\ndescription: Authoring guide for new skills.\n---\nDelete the template description: "Replace with description of the skill and when Claude should use it."\n');
+
+		expect(dropPlaceholder(incoming, 'template'))
+			.toBe(false);
+
+		expect(existsSync(join(incoming, 'template')))
+			.toBe(true);
+	}
+);
+
+test(
 	'dropPlaceholder leaves alone what it cannot recognise, and does nothing at all when turned off',
 	() => {
 		const incoming = join(scratch, 'unrecognisable-placeholder');
@@ -756,27 +992,129 @@ test(
 );
 
 test(
-	'readPluginSettings lets a project override the settings, from an ancestor directory as omp does',
+	'readPluginSettings reads the lock where omp keeps it, XDG layout included',
 	async () => {
-		const root = join(scratch, 'project');
-		const deep = join(root, 'packages', 'thing');
-		mkdirSync(join(root, '.omp'), { recursive: true });
-		mkdirSync(deep, { recursive: true });
+		writeLock({ sources: 'anthropics/skills', interval: 1 });
 
-		// omp keeps the lock beside the agent directory, under the same root.
-		const ompRoot = join(scratch, 'override-root');
-		mkdirSync(join(ompRoot, 'plugins'), { recursive: true });
-		writeFileSync(join(ompRoot, 'plugins', 'omp-plugins.lock.json'), JSON.stringify({ settings: { [PLUGIN_NAME]: { sources: 'anthropics/skills', interval: 1 } } }));
+		const { options, error } = await readPluginSettings(join(scratch, 'xdg-lock-cwd'));
 
-		writeFileSync(join(root, '.omp', 'plugin-overrides.json'), JSON.stringify({ settings: { [PLUGIN_NAME]: { sources: 'someone/their-skills' } } }));
+		expect(error).toBeUndefined();
 
-		const { options, error } = await readPluginSettings(join(ompRoot, 'agent'), deep);
+		expect(options)
+			.toEqual({ sources: 'anthropics/skills', interval: 1 });
+	}
+);
+
+test(
+	'readPluginSettings lets a project override the settings, from cwd as omp does',
+	async () => {
+		const project = join(scratch, 'override-project');
+		mkdirSync(join(project, '.omp'), { recursive: true });
+
+		writeLock({ sources: 'anthropics/skills', interval: 1 });
+		writeFileSync(join(project, '.omp', 'plugin-overrides.json'), JSON.stringify({ settings: { [PLUGIN_NAME]: { sources: 'someone/their-skills' } } }));
+
+		const { options, error } = await readPluginSettings(project);
 
 		expect(error).toBeUndefined();
 
 		// The project's `sources` wins; the interval it says nothing about is still the global one.
 		expect(options)
 			.toEqual({ sources: 'someone/their-skills', interval: 1 });
+	}
+);
+
+test(
+	'readPluginSettings does not walk ancestors for overrides, because omp reads them at cwd alone',
+	async () => {
+		const root = join(scratch, 'no-ancestor-walk');
+		const deep = join(root, 'packages', 'thing');
+		mkdirSync(join(root, '.omp'), { recursive: true });
+		mkdirSync(deep, { recursive: true });
+
+		writeLock({ sources: 'anthropics/skills' });
+
+		// An override omp would never see must not apply here either: what refreshes has to match what `omp plugin config list` says.
+		writeFileSync(join(root, '.omp', 'plugin-overrides.json'), JSON.stringify({ settings: { [PLUGIN_NAME]: { sources: 'someone/their-skills' } } }));
+
+		const { options, error } = await readPluginSettings(deep);
+
+		expect(error).toBeUndefined();
+
+		expect(options)
+			.toEqual({ sources: 'anthropics/skills' });
+	}
+);
+
+test(
+	'a project override that will not parse is skipped the way omp skips it, not read as an error',
+	async () => {
+		const project = join(scratch, 'override-malformed');
+		mkdirSync(join(project, '.claude'), { recursive: true });
+
+		writeLock({ sources: 'anthropics/skills' });
+
+		// Another tool's half-saved file must not switch this plugin off: the lock still parses, and the lock is where the sources live.
+		writeFileSync(join(project, '.claude', 'plugin-overrides.json'), '{ not json');
+
+		const { options, error } = await readPluginSettings(project);
+
+		expect(error).toBeUndefined();
+
+		expect(options)
+			.toEqual({ sources: 'anthropics/skills' });
+	}
+);
+
+test(
+	'a lock file that will not parse is still an error, so the user hears why nothing refreshes',
+	async () => {
+		mkdirSync(dirname(lockFile), { recursive: true });
+		writeFileSync(lockFile, '{ not json');
+
+		const { error } = await readPluginSettings(join(scratch, 'lock-malformed-cwd'));
+
+		expect(error).toBeDefined();
+	}
+);
+
+test(
+	'settleParked stands the parked skills back in when a dead swap left no live directory',
+	() => {
+		const target = join(scratch, 'parked-restore');
+		const { outgoing } = staging(target);
+
+		// A launch killed between the swap's two renames: the previous skills sit in `outgoing`, and `target` is gone.
+		mkdirSync(join(outgoing, 'precious-skill'), { recursive: true });
+
+		expect(settleParked(target))
+			.toBe(true);
+
+		expect(existsSync(join(target, 'precious-skill')))
+			.toBe(true);
+
+		expect(existsSync(outgoing))
+			.toBe(false);
+	}
+);
+
+test(
+	'settleParked discards the parked directory once a live one stands, since a finished swap has no more use for it',
+	() => {
+		const target = join(scratch, 'parked-discard');
+		const { outgoing } = staging(target);
+
+		mkdirSync(join(target, 'live-skill'), { recursive: true });
+		mkdirSync(join(outgoing, 'stale-skill'), { recursive: true });
+
+		expect(settleParked(target))
+			.toBe(false);
+
+		expect(existsSync(join(target, 'live-skill')))
+			.toBe(true);
+
+		expect(existsSync(outgoing))
+			.toBe(false);
 	}
 );
 
@@ -941,6 +1279,57 @@ test(
 );
 
 test(
+	'a download that could not be installed stays claimable, so the next launch retries the install instead of the download',
+	async () => {
+		const target = join(scratch, 'rearm', 'target');
+		const stamp = join(scratch, 'rearm', 'stamp');
+		const { incoming, done } = staging(target);
+
+		mkdirSync(join(incoming, 'a-skill'), { recursive: true });
+		writeFileSync(join(incoming, 'a-skill', 'SKILL.md'), '');
+		writeFileSync(done, '');
+
+		// A dangling link where the live directory should stand: `existsSync` reads it as absent, so the swap tries to stand the download straight in and the rename refuses.
+		symlinkSync(join(scratch, 'rearm', 'nowhere'), target, 'dir');
+
+		const { heard, run } = listener();
+		await run({ sources: [{ repo: 'someone/their-skills', target, stamp }] });
+
+		expect(heard.some((toast) => toast.message.includes('could not install')))
+			.toBe(true);
+
+		// The failure cost nothing but the attempt: the download is still whole and still claimed by nobody.
+		expect(existsSync(done))
+			.toBe(true);
+
+		expect(existsSync(join(incoming, 'a-skill', 'SKILL.md')))
+			.toBe(true);
+	}
+);
+
+test(
+	'a claim that finds nothing to install does not arm a marker it cannot honour',
+	async () => {
+		const target = join(scratch, 'rearm-empty', 'target');
+		const stamp = join(scratch, 'rearm-empty', 'stamp');
+		const { incoming, done } = staging(target);
+
+		// The marker without the download it records: the claim goes through, the install fails, and re-arming would loop that failure once per launch forever.
+		mkdirSync(dirname(done), { recursive: true });
+		writeFileSync(done, '');
+
+		const { run } = listener();
+		await run({ sources: [{ repo: 'someone/their-skills', target, stamp }] });
+
+		expect(existsSync(done))
+			.toBe(false);
+
+		expect(existsSync(incoming))
+			.toBe(false);
+	}
+);
+
+test(
 	'the plugin says nothing at all until it is configured',
 	async () => {
 		const { heard, run } = listener();
@@ -984,6 +1373,19 @@ test(
 
 		expect(heard[5]?.message)
 			.toContain('malformed source');
+	}
+);
+
+test(
+	'the plugin flags a stranger option even when the name shadows something Object inherits',
+	async () => {
+		const { heard, run } = listener();
+
+		// `'toString' in KNOWN_OPTIONS` is true by inheritance, which would wave the typo through silently.
+		await run({ sources: [], toString: true });
+
+		expect(heard.some((toast) => toast.message.includes('unknown options') && toast.message.includes('toString')))
+			.toBe(true);
 	}
 );
 

@@ -14,6 +14,15 @@ jobs:
     steps:
       - name: 'Checkout code'
         uses: 'actions/checkout@v7'
+      # First, before anything is installed: a mismatched tag fails in seconds instead of after the whole pipeline
+      - name: 'Check the tag matches the version being published'
+        run: |
+          version="$(jq -r .version package.json)"
+
+          if [ "$GITHUB_REF_NAME" != "$version" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match package.json version $version" >&2
+            exit 1
+          fi
       - name: 'Install Bun'
         uses: 'oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6'
         with:
@@ -22,6 +31,8 @@ jobs:
         run: 'bun install --frozen-lockfile'
       - name: 'Typecheck'
         run: 'bun run typecheck'
+      - name: 'Lint'
+        run: 'bun run lint'
       - name: 'Test'
         run: 'bun run test'
       - name: 'Install Node.js'
@@ -31,14 +42,6 @@ jobs:
       # Trusted publishing needs npm 11.5.1 or later, which the runner's Node may trail behind
       - name: 'Update npm'
         run: 'npm install --global npm@latest'
-      - name: 'Check the tag matches the version being published'
-        run: |
-          version="$(jq -r .version package.json)"
-
-          if [ "$GITHUB_REF_NAME" != "$version" ]; then
-            echo "Tag $GITHUB_REF_NAME does not match package.json version $version" >&2
-            exit 1
-          fi
       - name: 'Publish'
         run: 'npm publish'
       - name: 'Release'
