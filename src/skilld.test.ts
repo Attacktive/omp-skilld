@@ -48,16 +48,28 @@ interface SessionStartHandler {
 	(event: unknown, ctx: ExtensionContext): void | Promise<void>;
 }
 
+/** The pins standing in the stub's UI, keyed the way the plugin keys them: `undefined` is a pin taken down, which is a different thing from one never put up. */
+interface Board {
+	widgets: Record<string, string[] | undefined>;
+	statuses: Record<string, string | undefined>;
+}
+
 /** The slivers of {@link ExtensionAPI} and {@link ExtensionContext} the plugin actually reaches for. The rest cannot be stood up, hence the casts. */
 const listener = () => {
 	const heard: HeardToast[] = [];
+	const board: Board = { widgets: {}, statuses: {} };
 
 	let onSessionStart: SessionStartHandler | undefined;
+	let onTurnStart: (() => void) | undefined;
 
 	const piStub = {
 		on: (event: string, handler: SessionStartHandler) => {
 			if (event === 'session_start') {
 				onSessionStart = handler;
+			}
+
+			if (event === 'turn_start') {
+				onTurnStart = handler as unknown as () => void;
 			}
 		},
 		pi: { settings: { getAgentDir: () => join(scratch, 'agent') } }
@@ -73,6 +85,17 @@ const listener = () => {
 		ui: {
 			notify: (message: string, type: 'info' | 'warning' | 'error' = 'info') => {
 				heard.push({ message, type });
+			},
+			/** Colour belongs to whatever theme is loaded and is nothing a test can assert on, so the stub hands the text straight back and lets the glyphs speak for the state. */
+			theme: {
+				fg: (_colour: string, text: string) => text,
+				bold: (text: string) => text
+			},
+			setWidget: (key: string, content: string[] | undefined) => {
+				board.widgets[key] = content;
+			},
+			setStatus: (key: string, text: string | undefined) => {
+				board.statuses[key] = text;
 			}
 		},
 		hasUI: true,
@@ -133,7 +156,8 @@ const listener = () => {
 		flush();
 	};
 
-	return { heard, run, settleDownload };
+	/** `turn` is the user getting back to work, which is omp's cue for the plugin to take its settled pins down. */
+	return { heard, board, run, settleDownload, turn: () => onTurnStart?.() };
 };
 
 /**
@@ -157,7 +181,7 @@ const refreshWith = async (name: string, gh?: string) => {
 	const previousPath = process.env.PATH;
 	process.env.PATH = bin;
 
-	const { heard, run, settleDownload } = listener();
+	const { heard, board, run, settleDownload, turn } = listener();
 
 	try {
 		await run({ sources: [{ repo: 'someone/their-skills', target, stamp, label: name }] });
@@ -165,7 +189,7 @@ const refreshWith = async (name: string, gh?: string) => {
 		process.env.PATH = previousPath;
 	}
 
-	return { heard, settleDownload, target, stamp };
+	return { heard, board, settleDownload, turn, target, stamp };
 };
 
 test(
@@ -385,7 +409,7 @@ test(
 		linkSkills(target, linkRoot);
 
 		expect(linkSkills(target, linkRoot))
-			.toEqual({ linked: [], refused: [] });
+			.toEqual({ skills: ['pdf'], linked: [], refused: [] });
 	}
 );
 
@@ -425,7 +449,7 @@ test(
 		rmSync(join(target, 'dropped'), { recursive: true, force: true });
 
 		expect(linkSkills(target, linkRoot))
-			.toEqual({ linked: [], refused: [] });
+			.toEqual({ skills: ['pdf'], linked: [], refused: [] });
 
 		// The listing, rather than `existsSync`, because a link left dangling would read as absent while still sitting there.
 		expect(readdirSync(linkRoot).sort())
@@ -556,7 +580,7 @@ test(
 
 		// The second launch has to recognise its own link, not refuse it as the user's.
 		expect(linkSkills(`${target}/`, linkRoot))
-			.toEqual({ linked: [], refused: [] });
+			.toEqual({ skills: ['pdf'], linked: [], refused: [] });
 	}
 );
 
@@ -868,6 +892,79 @@ test(
 
 		expect(existsSync(staging(target).failed))
 			.toBe(false);
+	}
+);
+
+test(
+	'a finished refresh pins what it did where a toast cannot scroll away from it, counting only the skills omp will see',
+	async () => {
+		const { board, settleDownload, stamp } = await refreshWith(
+			'pin-success',
+			'mkdir -p "$6/one" "$6/two"\necho done > "$6/one/SKILL.md"\necho done > "$6/two/SKILL.md"\nexit 0\n'
+		);
+
+		await settleDownload(() => existsSync(stamp));
+
+		expect(board.widgets[`${PLUGIN_NAME}:pin-success`]?.join('\n'))
+			.toMatch(/✓ skilld · 2 skill\(s\) ready · restart omp/);
+
+		// The status bar has room for the count and nothing else, which is the part worth having there.
+		expect(board.statuses[`${PLUGIN_NAME}:pin-success`])
+			.toBe('✓ 2 skills');
+	}
+);
+
+test(
+	'a refresh that fails pins why, since a failure the user never saw is the one that looks like the plugin doing nothing',
+	async () => {
+		const { board, settleDownload, target } = await refreshWith('pin-failure', 'exit 1\n');
+
+		await settleDownload(() => existsSync(staging(target).failed));
+
+		expect(board.widgets[`${PLUGIN_NAME}:pin-failure`]?.join('\n'))
+			.toMatch(/✗ skilld · could not refresh pin-failure: `gh` exited with code 1/);
+
+		expect(board.statuses[`${PLUGIN_NAME}:pin-failure`])
+			.toBe('✗ refresh failed');
+	}
+);
+
+test(
+	'a settled pin comes down when the user gets back to work, which is what starting a turn says',
+	async () => {
+		const { board, settleDownload, turn, stamp } = await refreshWith(
+			'pin-release',
+			'mkdir -p "$6/one"\necho done > "$6/one/SKILL.md"\nexit 0\n'
+		);
+
+		await settleDownload(() => existsSync(stamp));
+
+		turn();
+
+		expect(board.widgets[`${PLUGIN_NAME}:pin-release`])
+			.toBeUndefined();
+
+		expect(board.statuses[`${PLUGIN_NAME}:pin-release`])
+			.toBeUndefined();
+	}
+);
+
+test(
+	'a download still running keeps its pin through a turn, since a thing in progress is not news to be dismissed',
+	async () => {
+		// Long enough that the download cannot settle within the test, so what is asserted is the pin of a refresh that is genuinely still running.
+		const { board, turn } = await refreshWith('pin-working', 'sleep 30\nexit 0\n');
+
+		expect(board.widgets[`${PLUGIN_NAME}:pin-working`]?.join('\n'))
+			.toMatch(/⟳ skilld · fetching pin-working from GitHub/);
+
+		turn();
+
+		expect(board.widgets[`${PLUGIN_NAME}:pin-working`]?.join('\n'))
+			.toMatch(/⟳ skilld/);
+
+		expect(board.statuses[`${PLUGIN_NAME}:pin-working`])
+			.toBe('⟳ skills');
 	}
 );
 

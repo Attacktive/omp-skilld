@@ -461,10 +461,13 @@ const linkSkills = (target: string, linkRoot: string) => {
 		kind = 'dir';
 	}
 
+	/** Every skill in the download, linked or not, so a caller can say how many of them omp is about to see. */
+	const skills = installedSkills(target);
+
 	const linked: string[] = [];
 	const refused: string[] = [];
 
-	for (const name of installedSkills(target)) {
+	for (const name of skills) {
 		const link = join(linkRoot, name);
 		const held = claim(link, target);
 
@@ -482,7 +485,7 @@ const linkSkills = (target: string, linkRoot: string) => {
 		linked.push(name);
 	}
 
-	return { linked, refused };
+	return { skills, linked, refused };
 };
 
 /**

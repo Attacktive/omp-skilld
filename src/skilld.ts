@@ -1,8 +1,8 @@
 /*
  * Keeps configured skills current by re-installing them from GitHub in the background.
  * The refresh is never awaited: `gh skill install --all` takes upwards of a minute, and omp loads extensions before it scans for skills, so awaiting it would put that minute on every launch.
- * Whatever is downloaded is picked up on the next launch instead; two toasts cover the wait, because a first launch that quietly comes up with no skills looks broken.
- * Nothing here is allowed to throw — a missing `gh` or an expired login degrades to an error toast, never a broken launch.
+ * Whatever is downloaded is picked up on the next launch instead; a pin under the editor and a pair of toasts cover the wait, because a first launch that quietly comes up with no skills looks broken.
+ * Nothing here is allowed to throw — a missing `gh` or an expired login degrades to an error toast and a pin saying why, never a broken launch.
  *
  * omp takes the module named in the plugin manifest's `extensions` entry and uses its default export as the factory, so that export is all this file offers; everything else lives in `internals.ts`, where it can be tested.
  */
@@ -22,6 +22,100 @@ type Toast = (message: string, variant: 'info' | 'warning' | 'error') => void;
 
 /** Where a refresh says what it did regardless of whether anyone is looking: toasts need a TUI, and the launches that need explaining most — `omp -p`, a CI run — have none. */
 type Log = (message: string) => void;
+
+/**
+ * Everything a refresh can say, and the two places it says it: a toast, which omp shows once and forgets, and a pin, which stays put until the news has been seen.
+ * A download runs for a minute, and a minute of transcript is exactly what buries a toast — so the pin is the same news somewhere it cannot scroll away.
+ */
+interface Voice {
+	/** Fire-and-forget by design, so nothing that happens to a toast can ever surface as an error. */
+	toast: Toast;
+	/** Holds a source in view for as long as its download runs. */
+	working: (label: string, detail: string) => void;
+	/** Replaces a source's pin with how the refresh turned out. `ok` picks the glyph and the colour; `status` is the same news in the few columns the status bar has. */
+	settled: (label: string, ok: boolean, detail: string, status: string) => void;
+	/** Takes down the pins whose news has been seen, which is what starting a turn means. A download still running keeps its pin: that one is not news, it is work in progress. */
+	release: () => void;
+}
+
+/** What a pin calls this plugin: `omp-skilld` is the package, and a status bar has no columns to spare for the prefix. */
+const BANNER = 'skilld';
+
+/** The three colours a pin comes in, each one omp's own — a pin is painted by whatever theme is loaded rather than in colours of its own choosing. */
+type Colour = 'accent' | 'success' | 'error';
+
+/**
+ * Pins go in the widget strip under the editor and in the status bar, neither of which exists without a TUI.
+ * Every call is guarded: a headless launch, a host whose `ctx.ui` predates widgets, or a session torn down mid-download all fall back to the log, which has the whole story regardless.
+ */
+const pinboard = (ctx: ExtensionContext): Voice => {
+	/** The labels whose pin is settled news, which are the only ones {@link Voice.release} may take down. */
+	const seen: Record<string, true> = {};
+
+	const key = (label: string) => `${PLUGIN_NAME}:${label}`;
+
+	const pin = (label: string, colour: Colour, glyph: string, detail: string, status: string) => {
+		try {
+			const { theme } = ctx.ui;
+
+			// A bar and a glyph in the pin's colour, the name in bold, the detail dimmed: loud enough to catch an eye on the editor, quiet enough to sit under one.
+			ctx.ui.setWidget(key(label), [`${theme.fg(colour, `▌ ${glyph}`)} ${theme.bold(BANNER)} ${theme.fg('dim', `· ${detail}`)}`], { placement: 'belowEditor' });
+
+			// Where the news survives a screen that has pushed the widget strip out of sight, in the handful of columns such a place has.
+			ctx.ui.setStatus(key(label), theme.fg(colour, `${glyph} ${status}`));
+		} catch {
+			// A mode with no widget strip, or a session already gone: the toast and the log say the same thing.
+		}
+	};
+
+	const unpin = (label: string) => {
+		try {
+			ctx.ui.setWidget(key(label), undefined);
+			ctx.ui.setStatus(key(label), undefined);
+		} catch {
+			// Nothing left to take down is the state this was aiming for.
+		}
+	};
+
+	return {
+		/*
+		 * Straight through: `ctx.ui` is wired before `session_start` is emitted in every omp mode — the real UI when there is one, a permanent no-op when there is not (`ctx.hasUI` says which) — so holding a toast back buys nothing and would only delay every error by the hold.
+		 * Headless launches still get the whole story through the log.
+		 */
+		toast: (message, variant) => {
+			try {
+				ctx.ui.notify(message, variant);
+			} catch {
+				// The session may have ended while the refresh was still running; there is nowhere left to say it.
+			}
+		},
+		working: (label, detail) => {
+			// A source that failed last launch and is being tried again this one has an old pin standing; it is superseded, not news, so it is no longer `release`'s to take down.
+			delete seen[label];
+
+			pin(label, 'accent', '⟳', detail, 'skills');
+		},
+		settled: (label, ok, detail, status) => {
+			seen[label] = true;
+
+			if (ok) {
+				pin(label, 'success', '✓', detail, status);
+				return;
+			}
+
+			pin(label, 'error', '✗', detail, status);
+		},
+		release: () => {
+			for (const label of Object.keys(seen)) {
+				delete seen[label];
+				unpin(label);
+			}
+		}
+	};
+};
+
+/** The voice of the session that ran the sweep, so the `turn_start` handler — registered at load, which is the only place registration belongs — can reach the pins that sweep put up. */
+let sessionVoice: Voice | undefined;
 
 /**
  * Starts the download and leaves it running.
@@ -58,9 +152,9 @@ const download = (repo: string, incoming: string, done: string, failed: string, 
  * Nothing is said about the links that were already right, since that is the common case — a name standing aside is repeated every launch, because it is the answer to why a skill never showed up.
  * Never fatal: the skills are installed either way, so a link that could not be written is worth saying out loud rather than failing a refresh over.
  */
-const publish = (source: NormalizedSource, linkRoot: string, toast: Toast, log: Log) => {
+const publish = (source: NormalizedSource, linkRoot: string, voice: Voice, log: Log) => {
 	try {
-		const { linked, refused } = linkSkills(source.target, linkRoot);
+		const { skills, linked, refused } = linkSkills(source.target, linkRoot);
 
 		if (linked.length > 0) {
 			log(`${source.label}: linked ${linked.length} skill(s) into ${linkRoot}`);
@@ -70,14 +164,19 @@ const publish = (source: NormalizedSource, linkRoot: string, toast: Toast, log: 
 			// Theirs outranks a download: the skill is still refreshed on disk, and the name is tried again next launch in case it has been given up since.
 			log(`${source.label}: not linked, since you have skills of those names already: ${refused.join(', ')}`);
 		}
+
+		// What omp will see of this source, which is every skill in it bar the names that were already somebody else's.
+		return skills.length - refused.length;
 	} catch (cause) {
 		log(`${source.label}: could not link into ${linkRoot}: ${reason(cause)}`);
-		toast(`Refreshed ${source.label}, but could not publish it into ${linkRoot}.`, 'error');
+		voice.toast(`Refreshed ${source.label}, but could not publish it into ${linkRoot}.`, 'error');
+
+		return 0;
 	}
 };
 
 /** A finished download becomes the live directory, its stamp is recorded, and the completion markers make way for the next refresh. Shared by the in-process exit handler and the launch that finds a finished download left behind by a dead one. */
-const complete = (source: NormalizedSource, dirs: Layout, toast: Toast, log: Log) => {
+const complete = (source: NormalizedSource, dirs: Layout, voice: Voice, log: Log) => {
 	const { target, stamp } = source;
 	const { incoming, done, failed, pid } = staging(target);
 
@@ -115,7 +214,9 @@ const complete = (source: NormalizedSource, dirs: Layout, toast: Toast, log: Log
 		}
 
 		log(`${source.label}: could not install the download: ${reason(cause)}`);
-		toast(`Downloaded ${source.label}, but could not install it — the skills you already had are untouched.`, 'error');
+		voice.toast(`Downloaded ${source.label}, but could not install it — the skills you already had are untouched.`, 'error');
+		voice.settled(source.label, false, `downloaded ${source.label}, but could not install it — the skills you already had are untouched`, 'install failed');
+
 		return;
 	}
 
@@ -126,32 +227,37 @@ const complete = (source: NormalizedSource, dirs: Layout, toast: Toast, log: Log
 		writeFileSync(stamp, '');
 	} catch (cause) {
 		log(`${source.label}: installed, but could not write ${stamp}: ${reason(cause)}`);
-		toast(`Refreshed ${source.label}, but could not record it — expect a redundant download next launch.`, 'error');
+		voice.toast(`Refreshed ${source.label}, but could not record it — expect a redundant download next launch.`, 'error');
+		voice.settled(source.label, false, `refreshed ${source.label}, but could not record it — expect a redundant download next launch`, 'stamp failed');
+
 		return;
 	}
 
 	rmSync(failed, { force: true });
 	rmSync(pid, { force: true });
 
-	publish(source, dirs.linkRoot, toast, log);
+	const published = publish(source, dirs.linkRoot, voice, log);
 
 	log(`${source.label}: installed into ${target}`);
 
 	let message = `${source.label} has been refreshed.\nRestart omp to pick up any changes.`;
+	let pinned = `${published} skill(s) refreshed · restart omp to pick them up`;
 
 	if (first) {
 		message = `${source.label} is ready.\nRestart omp to load it.`;
+		pinned = `${published} skill(s) ready · restart omp to load them`;
 	}
 
-	toast(message, 'info');
+	voice.toast(message, 'info');
+	voice.settled(source.label, true, pinned, `${published} skills`);
 };
 
 /** Whether the staging area leaves this launch a download to start, having said in the log what it found — and installed it, if that is what was waiting. */
-const proceed = (state: StagingState, source: NormalizedSource, dirs: Layout, toast: Toast, log: Log) => {
+const proceed = (state: StagingState, source: NormalizedSource, dirs: Layout, voice: Voice, log: Log) => {
 	switch (state) {
 		case 'finish':
 			log(`${source.label}: a download finished after the launch that started it; installing it now`);
-			complete(source, dirs, toast, log);
+			complete(source, dirs, voice, log);
 
 			return false;
 
@@ -176,7 +282,7 @@ const proceed = (state: StagingState, source: NormalizedSource, dirs: Layout, to
 };
 
 /** Fires one source's refresh off in the background and never waits on it. */
-const refresh = (configured: SkillSource, dirs: Layout, staleAfter: number, toast: Toast, log: Log, ctx: ExtensionContext) => {
+const refresh = (configured: SkillSource, dirs: Layout, staleAfter: number, voice: Voice, log: Log, ctx: ExtensionContext) => {
 	// The catch at the bottom needs a name for the source no matter how little of the body ran.
 	let label = JSON.stringify(configured);
 
@@ -204,10 +310,10 @@ const refresh = (configured: SkillSource, dirs: Layout, staleAfter: number, toas
 		}
 
 		if (existsSync(target)) {
-			publish(source, dirs.linkRoot, toast, log);
+			publish(source, dirs.linkRoot, voice, log);
 		}
 
-		if (!proceed(resolveStaging(target, stamp, staleAfter), source, dirs, toast, log)) {
+		if (!proceed(resolveStaging(target, stamp, staleAfter), source, dirs, voice, log)) {
 			return;
 		}
 
@@ -218,20 +324,29 @@ const refresh = (configured: SkillSource, dirs: Layout, staleAfter: number, toas
 
 		let announcement = `Refreshing ${label} from GitHub in the background.\nCarry on working — you will get a second message once it is done.`;
 
+		/** The same wait, in the one line a pin gets. */
+		let progress = `refreshing ${label} from GitHub in the background`;
+
 		const first = isEmpty(target);
 
 		if (first) {
 			announcement = `Fetching ${label} from GitHub in the background.\nThis usually takes a minute or so — carry on working, and you will get a second message the moment it is ready.`;
+			progress = `fetching ${label} from GitHub — a minute or so; carry on working`;
 		}
 
 		/*
 		 * Cancelled the moment the refresh settles: one that beats the TUI to it would otherwise promise a second message it has already sent, and a missing `gh` — which fails within milliseconds — would announce a download that never started.
 		 */
-		notice = ctx.setTimeout(() => toast(announcement, 'info'), ANNOUNCEMENT_DELAY_MS);
+		notice = ctx.setTimeout(() => voice.toast(announcement, 'info'), ANNOUNCEMENT_DELAY_MS);
 
 		const install = download(repo, incoming, done, failed, pid);
 
 		log(`${label}: downloading into ${incoming}`);
+
+		/*
+		 * Unlike the announcement, which waits out the delay: a pin costs a line under the editor rather than a notification, and a download that fails in milliseconds simply replaces it with why.
+		 */
+		voice.working(label, progress);
 
 		// Node warns that `exit` may or may not follow `error`, so whichever fires first speaks for the child.
 		let settled = false;
@@ -269,10 +384,11 @@ const refresh = (configured: SkillSource, dirs: Layout, staleAfter: number, toas
 			}
 		};
 
-		/** Every way a download that did start can fail: the log gets the detail, the toast gets the same detail in parentheses. */
+		/** Every way a download that did start can fail: the log gets the detail, the toast gets the same detail in parentheses, and the pin holds it until it has been seen. */
 		const speakOnFailure = (detail: string) => () => {
 			log(`${label}: ${detail}`);
-			toast(`Failed to refresh ${label} (${detail}).`, 'error');
+			voice.toast(`Failed to refresh ${label} (${detail}).`, 'error');
+			voice.settled(label, false, `could not refresh ${label}: ${detail}`, 'refresh failed');
 		};
 
 		/**
@@ -284,7 +400,8 @@ const refresh = (configured: SkillSource, dirs: Layout, staleAfter: number, toas
 				const detail = reason(cause);
 
 				log(`${label}: could not start the download: ${detail}`);
-				toast(`Could not refresh ${label}: ${detail}`, 'error');
+				voice.toast(`Could not refresh ${label}: ${detail}`, 'error');
+				voice.settled(label, false, `could not start the download for ${label}: ${detail}`, 'refresh failed');
 			};
 
 			finish(speak);
@@ -333,7 +450,7 @@ const refresh = (configured: SkillSource, dirs: Layout, staleAfter: number, toas
 			finish(() => {
 				writeFileSync(done, '');
 
-				complete(source, dirs, toast, log);
+				complete(source, dirs, voice, log);
 			});
 		};
 
@@ -351,16 +468,17 @@ const refresh = (configured: SkillSource, dirs: Layout, staleAfter: number, toas
 		}
 
 		log(`${label}: ${reason(cause)}`);
-		toast(`Could not refresh ${label}.`, 'error');
+		voice.toast(`Could not refresh ${label}.`, 'error');
+		voice.settled(label, false, `could not refresh ${label}`, 'refresh failed');
 	}
 };
 
-const sweep = async (agentDir: string, cwd: string, toast: Toast, log: Log, ctx: ExtensionContext) => {
+const sweep = async (agentDir: string, cwd: string, voice: Voice, log: Log, ctx: ExtensionContext) => {
 	const { options: given, error } = await readPluginSettings(cwd);
 
 	if (error !== undefined) {
 		log(`could not read the settings: ${error}`);
-		toast(`Could not read the ${PLUGIN_NAME} settings: ${error}`, 'error');
+		voice.toast(`Could not read the ${PLUGIN_NAME} settings: ${error}`, 'error');
 		return;
 	}
 
@@ -369,21 +487,21 @@ const sweep = async (agentDir: string, cwd: string, toast: Toast, log: Log, ctx:
 		.filter((key) => !Object.hasOwn(KNOWN_OPTIONS, key));
 
 	if (strangers.length > 0) {
-		toast(`Ignoring unknown options: ${strangers.map((stranger) => `\`${stranger}\``).join(', ')}. The options are \`sources\` and \`interval\`.`, 'error');
+		voice.toast(`Ignoring unknown options: ${strangers.map((stranger) => `\`${stranger}\``).join(', ')}. The options are \`sources\` and \`interval\`.`, 'error');
 	}
 
 	const sources = asSources(given.sources ?? []);
 
 	if (sources === undefined) {
 		log(`\`sources\` is neither a list of repositories nor JSON describing one: ${JSON.stringify(given.sources)}`);
-		toast('Ignoring `sources`: it has to be a list of repositories, such as `anthropics/skills`.', 'error');
+		voice.toast('Ignoring `sources`: it has to be a list of repositories, such as `anthropics/skills`.', 'error');
 		return;
 	}
 
 	let staleAfter = asInterval(given.interval);
 
 	if (staleAfter === undefined) {
-		toast(`Ignoring \`interval\`: ${JSON.stringify(given.interval)} is not a number of milliseconds.`, 'error');
+		voice.toast(`Ignoring \`interval\`: ${JSON.stringify(given.interval)} is not a number of milliseconds.`, 'error');
 		staleAfter = DEFAULT_INTERVAL_MS;
 	}
 
@@ -392,15 +510,21 @@ const sweep = async (agentDir: string, cwd: string, toast: Toast, log: Log, ctx:
 	for (const configured of sources) {
 		if (!isSource(configured)) {
 			log(`ignoring a malformed source: ${JSON.stringify(configured)}`);
-			toast(`Ignoring a malformed source: ${JSON.stringify(configured)}. A source is an \`owner/repo\`, or an object naming one.`, 'error');
+			voice.toast(`Ignoring a malformed source: ${JSON.stringify(configured)}. A source is an \`owner/repo\`, or an object naming one.`, 'error');
 			continue;
 		}
 
-		refresh(configured, dirs, staleAfter, toast, log, ctx);
+		refresh(configured, dirs, staleAfter, voice, log, ctx);
 	}
 };
 
 const plugin = (pi: ExtensionAPI): void => {
+	/*
+	 * A settled pin is news until the user gets back to work, and starting a turn is what that looks like.
+	 * Registered here rather than from inside `session_start`, since the load phase is where omp takes registrations.
+	 */
+	pi.on('turn_start', () => sessionVoice?.release());
+
 	/*
 	 * The extension factory runs once per session — subagents included — so the sweep is guarded to once per process.
 	 * A second session inside the same launch has nothing to add: the stamp records freshness, and the staging sweep already ran.
@@ -428,20 +552,10 @@ const plugin = (pi: ExtensionAPI): void => {
 			}
 		};
 
-		/*
-		 * Straight through: `ctx.ui` is wired before `session_start` is emitted in every omp mode — the real UI when there is one, a permanent no-op when there is not (`ctx.hasUI` says which) — so holding a toast back buys nothing and would only delay every error by the hold.
-		 * Headless launches still get the whole story through the log.
-		 */
-		const toast: Toast = (message, variant) => {
-			try {
-				ctx.ui.notify(message, variant);
-			} catch {
-				// The session may have ended while the refresh was still running; there is nowhere left to say it.
-			}
-		};
+		sessionVoice = pinboard(ctx);
 
 		// Recorded rather than awaited: the launch never waits on the sweep, but the tests need to.
-		sweepGuard.settled = sweep(agentDir, ctx.cwd, toast, log, ctx);
+		sweepGuard.settled = sweep(agentDir, ctx.cwd, sessionVoice, log, ctx);
 	});
 };
 

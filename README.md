@@ -3,7 +3,7 @@
 An unofficial [OMP](https://oh-my-pi.dev) plugin that keeps skills from GitHub repositories up to date, in the background.
 
 `gh skill install --all` takes upwards of a minute, and OMP loads extensions before it scans for skills — so refreshing on the critical path would put that minute on every single launch.
-Skilld fires the refresh off unawaited and lets the next launch pick up whatever landed, with a pair of toasts so a first run does not just sit there looking broken.
+Skilld fires the refresh off unawaited and lets the next launch pick up whatever landed, pinning what it is doing under the editor — and how it turned out — so a first run does not just sit there looking broken.
 Downloads land in a directory of the plugin's own and are published into the one OMP already scans, so nothing has to be configured for a skill to show up.
 
 > [!NOTE]
@@ -164,8 +164,9 @@ A flat list of directories, and not too many. A repository that files skills by 
 - Publishes into `~/.omp/agent/skills` as one symlink per skill, on every launch rather than only after a download, so a link deleted by hand or a name freed since the last refresh is repaired at once. A link into the download root is the plugin's to remove; anything else there is yours and is never touched, which is also how a skill dropped upstream gets its name freed again.
 - A name already taken by a directory of your own is left alone rather than replaced, and reported to the log. The download still refreshes, so freeing the name is all it takes to get it.
 - Nothing throws. A missing `gh`, an expired login, a plane — all of them degrade to an error toast, never a broken launch.
-- Every outcome is written to OMP's log (`~/.omp/logs/omp.<date>.<pid>.log`) as well as toasted, because the launches that need explaining most — `omp -p`, a CI run — have no TUI to toast into.
-- The "in the background" announcement is held back a few seconds, so a refresh that settles within the first beat — a missing `gh` fails in milliseconds — speaks for itself instead of arriving after a promise it already broke. Everything else is said the moment it happens.
+- Says everything twice on purpose, because the two surfaces lose different things. A toast is shown once and scrolls away with the transcript, which is exactly what a minute-long download outlives; a pin sits in the widget strip under the editor with a glyph and the source's name — `⟳` while it downloads, `✓` with the skill count when it lands, `✗` with the reason when it does not — and stays there until you start your next turn. A download still running keeps its pin through that turn, since it is not news to be dismissed. The status bar carries the same state in the few columns it has.
+- Every outcome is written to OMP's log (`~/.omp/logs/omp.<date>.<pid>.log`) as well as toasted and pinned, because the launches that need explaining most — `omp -p`, a CI run — have no TUI for either.
+- The "in the background" announcement is held back a few seconds, so a refresh that settles within the first beat — a missing `gh` fails in milliseconds — speaks for itself instead of arriving after a promise it already broke. Everything else is said the moment it happens; the pin goes up at once, since a pin that is superseded costs a line under the editor rather than a notification.
 - The sweep runs once per launch, on the first session — subagents do not each get their own refresh.
 
 ## Windows
