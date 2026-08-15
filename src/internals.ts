@@ -5,7 +5,7 @@
 
 import { getPluginSettings } from '@oh-my-pi/pi-coding-agent/extensibility/plugins/loader';
 import { parseFrontmatter } from '@oh-my-pi/pi-utils';
-import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, statSync, symlinkSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, renameSync, rmdirSync, rmSync, statSync, symlinkSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 
@@ -427,13 +427,37 @@ const claim = (link: string, target: string) => {
 	}
 };
 
+/**
+ * Removes the link itself and never what it points at.
+ * A junction is a directory as far as Windows is concerned, so the unlink that takes a symlink everywhere else fails on one; `rmdir` takes the reparse point alone.
+ * Reaching for `recursive` instead would be worse than the failure it fixes — it would follow the junction and delete the skills behind it, which on a link the user made is their own directory.
+ */
+const unlink = (link: string) => {
+	if (process.platform !== 'win32') {
+		rmSync(link, { force: true });
+		return;
+	}
+
+	try {
+		rmdirSync(link);
+	} catch (cause) {
+		/*
+		 * `force` is what makes a link already gone a non-event on the other branch, and `rmdir` has no such flag, so the same forgiveness is spelled out here.
+		 * Two launches sweeping the same directory at once is ordinary — a link one of them removed between this one's `readdir` and its `rmdir` is the other doing its job, not a failure.
+		 */
+		if ((cause as NodeJS.ErrnoException).code !== 'ENOENT') {
+			throw cause;
+		}
+	}
+};
+
 /** Links this plugin wrote for skills that are no longer in the download: the name has to be free again before anything else can claim it. */
 const sweepLinks = (target: string, linkRoot: string) => {
 	for (const name of readdirSync(linkRoot)) {
 		const link = join(linkRoot, name);
 
 		if (claim(link, target) === 'ours' && !existsSync(link)) {
-			rmSync(link, { force: true });
+			unlink(link);
 		}
 	}
 };
@@ -637,4 +661,4 @@ const readPluginSettings = async (cwd: string): Promise<{ options: Record<string
 	}
 };
 
-export { DEFAULT_INTERVAL_MS, ANNOUNCEMENT_DELAY_MS, DEFAULT_PLACEHOLDER, ABANDONED_MS, FAILURE_COOLDOWN_MS, NOT_FOUND, NOT_EXECUTABLE, PLUGIN_NAME, type SkillRepository, type SkillSource, type Options, type NormalizedSource, type StagingState, type Layout, slugify, reason, expand, asInterval, asPlaceholder, asSources, isRepo, isSource, layout, normalize, staging, installCommand, settleParked, swap, isStale, isEmpty, dropPlaceholder, linkSkills, resolveStaging, readPluginSettings };
+export { DEFAULT_INTERVAL_MS, ANNOUNCEMENT_DELAY_MS, DEFAULT_PLACEHOLDER, ABANDONED_MS, FAILURE_COOLDOWN_MS, NOT_FOUND, NOT_EXECUTABLE, PLUGIN_NAME, type SkillRepository, type SkillSource, type Options, type NormalizedSource, type StagingState, type Layout, slugify, reason, expand, asInterval, asPlaceholder, asSources, isRepo, isSource, layout, normalize, staging, installCommand, settleParked, swap, isStale, isEmpty, dropPlaceholder, linkSkills, unlink, resolveStaging, readPluginSettings };

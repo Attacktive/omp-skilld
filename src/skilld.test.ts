@@ -1,13 +1,13 @@
 import type { ExtensionAPI, ExtensionContext } from '@oh-my-pi/pi-coding-agent';
-import { refreshDirsFromEnv } from '@oh-my-pi/pi-utils';
+import { getPluginsLockfile, refreshDirsFromEnv } from '@oh-my-pi/pi-utils';
 import { afterAll, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readlinkSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import * as pluginModule from './skilld.ts';
 import plugin from './skilld.ts';
-import { ABANDONED_MS, DEFAULT_INTERVAL_MS, FAILURE_COOLDOWN_MS, NOT_EXECUTABLE, NOT_FOUND, PLUGIN_NAME, asInterval, asPlaceholder, asSources, dropPlaceholder, expand, installCommand, isEmpty, isRepo, isSource, isStale, layout, linkSkills, normalize, readPluginSettings, resolveStaging, settleParked, slugify, staging, swap, sweepGuard } from './internals.ts';
+import { ABANDONED_MS, DEFAULT_INTERVAL_MS, FAILURE_COOLDOWN_MS, NOT_EXECUTABLE, NOT_FOUND, PLUGIN_NAME, asInterval, asPlaceholder, asSources, dropPlaceholder, expand, installCommand, isEmpty, isRepo, isSource, isStale, layout, linkSkills, normalize, unlink, readPluginSettings, resolveStaging, settleParked, slugify, staging, swap, sweepGuard } from './internals.ts';
 
 const INTERVAL_MS = 24 * 60 * 60 * 1000;
 
@@ -22,16 +22,22 @@ const scratch = mkdtempSync(join(tmpdir(), 'skilld-'));
 afterAll(() => rmSync(scratch, { recursive: true, force: true }));
 
 /*
- * The host resolves the plugins lock through its XDG-aware directory layout, so the tests point XDG at the scratch to stay off the real `~/.omp`.
- * The resolver freezes its environment when `pi-utils` loads, hence the rebuild once the variables are in place — and `$XDG_DATA_HOME/omp` has to exist for the redirect to engage, the same bar `omp config init-xdg` sets.
+ * The host resolves the plugins lock through its own directory layout, so the tests point that layout at the scratch to stay off the real `~/.omp`.
+ * XDG is a Linux and macOS convention as far as the host is concerned — Windows ignores the variables outright — so the redirect there is `PI_CODING_AGENT_DIR`, which every platform honours.
+ * The resolver freezes its environment when `pi-utils` loads, hence the rebuild once the variables are in place — and `$XDG_DATA_HOME/omp` has to exist for the XDG redirect to engage, the same bar `omp config init-xdg` sets.
  */
-process.env.XDG_DATA_HOME = join(scratch, 'xdg');
-delete process.env.PI_CODING_AGENT_DIR;
-mkdirSync(join(scratch, 'xdg', 'omp'), { recursive: true });
+if (process.platform === 'win32') {
+	process.env.PI_CODING_AGENT_DIR = join(scratch, 'omp');
+} else {
+	process.env.XDG_DATA_HOME = join(scratch, 'xdg');
+	delete process.env.PI_CODING_AGENT_DIR;
+	mkdirSync(join(scratch, 'xdg', 'omp'), { recursive: true });
+}
+
 refreshDirsFromEnv();
 
-/** The lock omp itself would read and write under the XDG layout above. */
-const lockFile = join(scratch, 'xdg', 'omp', 'plugins', 'omp-plugins.lock.json');
+/** The lock omp itself would read and write, asked for rather than assumed: which layout is in force is the host's business and differs by platform. */
+const lockFile = getPluginsLockfile();
 
 /** Writes this plugin's settings into the lock the way omp persists them. */
 const writeLock = (settings: unknown) => {
@@ -387,8 +393,9 @@ test(
 		expect(layout(join(homedir(), '.omp', 'agent')))
 			.toEqual({ root: join(homedir(), '.omp', 'skilld'), linkRoot: join(homedir(), '.omp', 'agent', 'skills') });
 
-		expect(layout('/xdg/omp/agent'))
-			.toEqual({ root: '/xdg/omp/skilld', linkRoot: '/xdg/omp/agent/skills' });
+		// Spelled with `join` rather than as a literal, because a separator is the platform's to choose and this asserts on where the paths land, not on how they are punctuated.
+		expect(layout(join('/xdg', 'omp', 'agent')))
+			.toEqual({ root: join('/xdg', 'omp', 'skilld'), linkRoot: join('/xdg', 'omp', 'agent', 'skills') });
 	}
 );
 
@@ -487,10 +494,11 @@ test(
 	() => {
 		const source = normalize('anthropics/skills', '/omp/skilld');
 
+		// `normalize` resolves what it derives, so the expectation resolves too: on Windows that is what puts a drive letter in front of a rooted path.
 		expect(source).toEqual({
 			repo: 'anthropics/skills',
-			target: '/omp/skilld/anthropics-skills',
-			stamp: '/omp/skilld/.anthropics-skills-refreshed',
+			target: resolve('/omp/skilld/anthropics-skills'),
+			stamp: resolve('/omp/skilld/.anthropics-skills-refreshed'),
 			label: 'anthropics/skills',
 			placeholder: 'template'
 		});
@@ -509,7 +517,9 @@ test(
 		writeFileSync(stamp, '');
 		mkdirSync(linkRoot, { recursive: true });
 		linkDir(join(target, 'pdf'), join(linkRoot, 'pdf'));
-		rmSync(join(linkRoot, 'pdf'));
+
+		// The user deleting a published link by hand, which is the thing this test is about — removed the way the plugin removes one, since a junction is not something `rm` can take.
+		unlink(join(linkRoot, 'pdf'));
 
 		const { run } = listener();
 		await run({ sources: [{ repo: 'someone/their-skills', target, stamp }], interval: INTERVAL_MS });
@@ -550,7 +560,7 @@ test(
 		};
 
 		expect(normalize(overridden, '/omp/skilld'))
-			.toEqual(overridden);
+			.toEqual({ ...overridden, target: resolve(overridden.target), stamp: resolve(overridden.stamp) });
 	}
 );
 
@@ -566,10 +576,10 @@ test(
 		const source = normalize({ repo: 'someone/their-skills', target: '~/skills', stamp: '~/state/stamp' }, '/omp/skilld');
 
 		expect(source.target)
-			.toBe(`${homedir()}/skills`);
+			.toBe(join(homedir(), 'skills'));
 
 		expect(source.stamp)
-			.toBe(`${homedir()}/state/stamp`);
+			.toBe(join(homedir(), 'state', 'stamp'));
 	}
 );
 
@@ -585,10 +595,10 @@ test(
 		const source = normalize({ repo: 'someone/their-skills', target: '/skills/anthropic/', stamp: '/state/./anthropic-stamp' }, '/omp/skilld');
 
 		expect(source.target)
-			.toBe('/skills/anthropic');
+			.toBe(resolve('/skills/anthropic'));
 
 		expect(source.stamp)
-			.toBe('/state/anthropic-stamp');
+			.toBe(resolve('/state/anthropic-stamp'));
 	}
 );
 
