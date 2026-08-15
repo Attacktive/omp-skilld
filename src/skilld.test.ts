@@ -161,6 +161,28 @@ const listener = () => {
 };
 
 /**
+ * The cases that plant a fake `gh` and let the real code spawn it.
+ * The fake is a `#!/bin/sh` script on a scratch `PATH`, which Windows has no way to execute — and production does not go through a shell there either, so what these cover is the POSIX path by definition rather than by accident.
+ */
+const onPosix = test.skipIf(process.platform === 'win32');
+
+/**
+ * Plants a directory link of the kind production plants, which on Windows is a junction rather than a symlink.
+ * A test that hands the real code a link to read has to hand it the same kind it makes, or the ownership check never meets the `\\?\` spelling a junction reads back as — which is the one thing about links that is Windows' own.
+ */
+const linkDir = (to: string, at: string) => {
+	let kind: 'junction' | 'dir';
+
+	if (process.platform === 'win32') {
+		kind = 'junction';
+	} else {
+		kind = 'dir';
+	}
+
+	symlinkSync(to, at, kind);
+};
+
+/**
  * Runs one real refresh against a fake `gh` planted on `PATH`, so the spawn, the exit handling and the install run exactly as production wires them.
  * `PATH` holds the fake bin and nothing else — a machine's real `gh` must stay unreachable, or these tests would hit the network — so the wrapper's `sh` resolves through a link planted beside the fake, and the fake script re-arms its own `PATH` for the tools it calls.
  */
@@ -421,7 +443,7 @@ test(
 
 		mkdirSync(join(linkRoot, 'pdf'), { recursive: true });
 		mkdirSync(mine, { recursive: true });
-		symlinkSync(mine, join(linkRoot, 'docx'), 'dir');
+		linkDir(mine, join(linkRoot, 'docx'));
 
 		const { linked, refused } = linkSkills(target, linkRoot);
 
@@ -445,7 +467,7 @@ test(
 
 		linkSkills(target, linkRoot);
 		mkdirSync(theirs, { recursive: true });
-		symlinkSync(theirs, join(linkRoot, 'kept'), 'dir');
+		linkDir(theirs, join(linkRoot, 'kept'));
 		rmSync(join(target, 'dropped'), { recursive: true, force: true });
 
 		expect(linkSkills(target, linkRoot))
@@ -486,7 +508,7 @@ test(
 		writeFileSync(join(target, 'pdf', 'SKILL.md'), '');
 		writeFileSync(stamp, '');
 		mkdirSync(linkRoot, { recursive: true });
-		symlinkSync(join(target, 'pdf'), join(linkRoot, 'pdf'), 'dir');
+		linkDir(join(target, 'pdf'), join(linkRoot, 'pdf'));
 		rmSync(join(linkRoot, 'pdf'));
 
 		const { run } = listener();
@@ -737,8 +759,8 @@ test(
 	() => {
 		const { target, incoming, pid } = staged('resolve-dead');
 
-		// A process that has already exited: hard-killed mid-download, its directory still fresh.
-		const gone = spawnSync('/bin/sh', ['-c', 'exit 0']).pid;
+		// A process that has already exited: hard-killed mid-download, its directory still fresh. The runtime running this suite is the one executable every platform is guaranteed to have.
+		const gone = spawnSync(process.execPath, ['-e', '']).pid;
 		writeFileSync(pid, String(gone));
 
 		expect(resolveStaging(target, join(scratch, 'never-refreshed'), INTERVAL_MS))
@@ -803,7 +825,7 @@ const runInstall = (name: string, gh?: { script: string; mode: number }) => {
 	return { status, done: existsSync(done), failed: existsSync(failed) };
 };
 
-test(
+onPosix(
 	'a `gh` that cannot be found leaves no marker, so a cooldown it never earned is not armed',
 	() => {
 		expect(runInstall('gh-missing'))
@@ -811,7 +833,7 @@ test(
 	}
 );
 
-test(
+onPosix(
 	'a `gh` that cannot be executed leaves no marker either',
 	() => {
 		const { status, ...markers } = runInstall('gh-unrunnable', { script: '#!/bin/sh\nexit 0\n', mode: 0o644 });
@@ -828,7 +850,7 @@ test(
 	}
 );
 
-test(
+onPosix(
 	'a `gh` that ran and failed leaves the failure marker the cooldown reads',
 	() => {
 		expect(runInstall('gh-failed', { script: '#!/bin/sh\nexit 1\n', mode: 0o755 }))
@@ -836,7 +858,7 @@ test(
 	}
 );
 
-test(
+onPosix(
 	'a `gh` that succeeded leaves the completion marker a later launch installs from',
 	() => {
 		expect(runInstall('gh-succeeded', { script: '#!/bin/sh\nexit 0\n', mode: 0o755 }))
@@ -844,7 +866,7 @@ test(
 	}
 );
 
-test(
+onPosix(
 	'a refresh downloads, installs, stamps and publishes end to end',
 	async () => {
 		const { heard, settleDownload, target, stamp } = await refreshWith(
@@ -872,7 +894,7 @@ test(
 	}
 );
 
-test(
+onPosix(
 	'a refresh whose download fails records the failure and keeps the cooldown armed',
 	async () => {
 		const { heard, settleDownload, target, stamp } = await refreshWith(
@@ -894,7 +916,7 @@ test(
 	}
 );
 
-test(
+onPosix(
 	'a refresh with no `gh` to run says so, and arms no cooldown it never earned',
 	async () => {
 		const { heard, settleDownload, target } = await refreshWith('e2e-no-gh');
@@ -909,7 +931,7 @@ test(
 	}
 );
 
-test(
+onPosix(
 	'a finished refresh pins what it did where a toast cannot scroll away from it, counting only the skills omp will see',
 	async () => {
 		const { board, settleDownload, stamp } = await refreshWith(
@@ -928,7 +950,7 @@ test(
 	}
 );
 
-test(
+onPosix(
 	'a refresh that fails pins why, since a failure the user never saw is the one that looks like the plugin doing nothing',
 	async () => {
 		const { board, settleDownload, target } = await refreshWith('pin-failure', 'exit 1\n');
@@ -943,7 +965,7 @@ test(
 	}
 );
 
-test(
+onPosix(
 	'a settled pin comes down when the user gets back to work, which is what starting a turn says',
 	async () => {
 		const { board, settleDownload, turn, stamp } = await refreshWith(
@@ -963,7 +985,7 @@ test(
 	}
 );
 
-test(
+onPosix(
 	'a download still running keeps its pin through a turn, since a thing in progress is not news to be dismissed',
 	async () => {
 		// Long enough that the download cannot settle within the test, so what is asserted is the pin of a refresh that is genuinely still running.
@@ -1401,7 +1423,7 @@ test(
 		writeFileSync(done, '');
 
 		// A dangling link where the live directory should stand: `existsSync` reads it as absent, so the swap tries to stand the download straight in and the rename refuses.
-		symlinkSync(join(scratch, 'rearm', 'nowhere'), target, 'dir');
+		linkDir(join(scratch, 'rearm', 'nowhere'), target);
 
 		const { heard, run } = listener();
 		await run({ sources: [{ repo: 'someone/their-skills', target, stamp }] });

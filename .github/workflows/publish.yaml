@@ -13,7 +13,7 @@ jobs:
 
     steps:
       - name: 'Checkout code'
-        uses: 'actions/checkout@v7'
+        uses: 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
       # First, before anything is installed: a mismatched tag fails in seconds instead of after the whole pipeline
       - name: 'Check the tag matches the version being published'
         run: |
@@ -36,7 +36,7 @@ jobs:
       - name: 'Test'
         run: 'bun run test'
       - name: 'Install Node.js'
-        uses: 'actions/setup-node@v7'
+        uses: 'actions/setup-node@820762786026740c76f36085b0efc47a31fe5020'
         with:
           node-version: '24'
       # Trusted publishing needs npm 11.5.1 or later, which the runner's Node may trail behind

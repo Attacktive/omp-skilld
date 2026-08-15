@@ -6,14 +6,20 @@ on:
     branches: ['main']
 jobs:
   test:
-    runs-on: 'ubuntu-latest'
+    # Every platform the plugin claims to work on, since what it does differs by platform: `gh` goes through a shell everywhere but Windows, and publication is a junction there rather than a symlink
+    strategy:
+      # One platform failing must not hide the state of the other two, which is the whole point of running all three
+      fail-fast: false
+      matrix:
+        os: ['ubuntu-latest', 'macos-latest', 'windows-latest']
+    runs-on: ${{ matrix.os }}
     permissions:
       # Required to checkout the code
       contents: 'read'
 
     steps:
       - name: 'Checkout code'
-        uses: 'actions/checkout@v7'
+        uses: 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
       - name: 'Install Bun'
         uses: 'oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6'
         with:
