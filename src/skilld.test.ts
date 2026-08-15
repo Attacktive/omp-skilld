@@ -795,6 +795,11 @@ const runInstall = (name: string, gh?: { script: string; mode: number }) => {
 		throw error;
 	}
 
+	// A null status is the shell itself having been killed, which is not a verdict any case here is waiting on — and saying so leaves every caller a plain number to assert against.
+	if (status === null) {
+		throw new Error('`sh` was killed before it could reach a verdict');
+	}
+
 	return { status, done: existsSync(done), failed: existsSync(failed) };
 };
 
@@ -809,8 +814,17 @@ test(
 test(
 	'a `gh` that cannot be executed leaves no marker either',
 	() => {
-		expect(runInstall('gh-unrunnable', { script: '#!/bin/sh\nexit 0\n', mode: 0o644 }))
-			.toEqual({ status: NOT_EXECUTABLE, done: false, failed: false });
+		const { status, ...markers } = runInstall('gh-unrunnable', { script: '#!/bin/sh\nexit 0\n', mode: 0o644 });
+
+		/*
+		 * Which of the two verdicts a `gh` it cannot run earns is the shell's own business, and they disagree: 126 where the search stops at the file, 127 where it goes on looking and ends up with nothing.
+		 * The plugin exempts both from the failure marker for exactly that reason, so pinning one of them here would only test which `/bin/sh` the suite happens to be running on.
+		 */
+		expect([NOT_EXECUTABLE, NOT_FOUND])
+			.toContain(status);
+
+		expect(markers)
+			.toEqual({ done: false, failed: false });
 	}
 );
 
