@@ -90,7 +90,8 @@ jobs:
           # A fixed cap rather than the model context window, since the free roster rotates and its limits rotate with it
           limit=120000
           if [ "$(wc -c < diff.patch)" -gt "$limit" ]; then
-            head -c "$limit" diff.patch > diff.head
+            # Dropping the partial last line is what keeps the cut from landing inside a hunk and handing the model a malformed one
+            head -c "$limit" diff.patch | sed '$d' > diff.head
             mv diff.head diff.patch
             instructions="$instructions
           The diff was truncated before it reached you. Review only what is shown, and say that it was cut."
