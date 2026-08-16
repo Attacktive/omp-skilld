@@ -1,0 +1,194 @@
+name: 'AI PR Review'
+on:
+  pull_request:
+    # `synchronize` costs a request per push, which the per-model free limit can afford, and the comment is edited in place rather than stacked — so a re-review updates the one that is already there
+    types: ['opened', 'reopened', 'synchronize']
+
+  workflow_dispatch:
+    inputs:
+      pull-request:
+        description: 'PR number to review'
+        required: true
+
+# One review per pull request, so a re-run supersedes the one it interrupted rather than racing it to the same comment
+concurrency:
+  group: review-${{ github.event.pull_request.number || inputs.pull-request }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: 'ubuntu-latest'
+    # Five models at five minutes each is the worst case the retry loop allows, and a run that passes it is hung rather than slow
+    timeout-minutes: 30
+    if: github.actor != 'dependabot[bot]'
+    permissions:
+      contents: 'read'
+      pull-requests: 'write'
+
+    env:
+      # 'zen' needs no key at all; 'openrouter' reads OPEN_ROUTER_API_KEY, which need not exist until then
+      PROVIDER: 'zen'
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      OPEN_ROUTER_API_KEY: ${{ secrets.OPEN_ROUTER_API_KEY }}
+      PR: ${{ github.event.pull_request.number || inputs.pull-request }}
+
+    steps:
+      - name: 'Review the diff'
+        run: |
+          case "$PROVIDER" in
+            zen)
+              url='https://opencode.ai/zen/v1/chat/completions'
+              auth=''
+              label='OpenCode Zen'
+              # The free limit is per model rather than per account, so a list is what turns one model's 429 into a review anyway.
+              # Ordered by what each one did to a diff with known bugs planted in it: the first found every one of them, and the two left out of this list are why the order matters.
+              # `laguna-s-2.1-free` answered "No findings." to that same diff, and a model that green-lights anything is worse here than no review at all; `hy3-free` spends its whole budget reasoning and returns an empty answer.
+              models=('nemotron-3-ultra-free' 'big-pickle' 'deepseek-v4-flash-free' 'mimo-v2.5-free' 'nemotron-3.5-lightning-free')
+              ;;
+            openrouter)
+              # Without this the empty key goes out as `Bearer `, every model answers 401, and a secret nobody set reads as a provider having a bad day
+              if [ -z "$OPEN_ROUTER_API_KEY" ]; then
+                echo '::error::PROVIDER is openrouter but the OPEN_ROUTER_API_KEY secret is not set'
+                exit 1
+              fi
+
+              url='https://openrouter.ai/api/v1/chat/completions'
+              auth="Authorization: Bearer $OPEN_ROUTER_API_KEY"
+              label='OpenRouter'
+              models=('cohere/north-mini-code:free' 'openai/gpt-oss-20b:free')
+              ;;
+            *)
+              # The one failure worth going red for: every other one belongs to the provider, but this one is a typo in this file
+              echo "::error::unknown PROVIDER '$PROVIDER'"
+              exit 1
+              ;;
+          esac
+
+          if ! gh pr diff "$PR" > diff.patch; then
+            echo '::notice::could not read the diff; leaving the pull request alone'
+            exit 0
+          fi
+
+          # An empty diff reaches the model as no diff at all, and a model given nothing to review answers that it found nothing wrong
+          if [ ! -s diff.patch ]; then
+            echo '::notice::the diff is empty; nothing to review'
+            exit 0
+          fi
+
+          instructions='You are reviewing a pull request for a TypeScript plugin that runs inside a coding agent.
+          Report only defects you can point at: correctness bugs, unhandled errors, race conditions, resource leaks, and mistakes that differ between Linux, macOS and Windows.
+          Do not summarise the diff, do not praise it, and do not comment on formatting or style.
+          At most three findings, worst first — three is what fits in the budget, and a fourth that arrives cut off in the middle of a word is worth less than nothing.
+          `where` is the file and the function or symbol in it; `trigger` is the input or state that makes the defect happen.
+          Be terse: one sentence per field. An empty array if nothing is wrong.'
+
+          # Asking for a schema is what keeps these models out of prose: the same diff that produced 266 lines of a model thinking aloud comes back as five findings and a sixth of the tokens.
+          # No `line` field on purpose — it is the one these models invent, and it was garbage in the JSON besides.
+          schema='{"type": "json_schema", "json_schema": {"name": "review", "strict": true, "schema": {"type": "object", "properties": {"findings": {"type": "array", "items": {"type": "object", "properties": {"severity": {"type": "string", "enum": ["high", "medium", "low"]}, "where": {"type": "string"}, "defect": {"type": "string"}, "trigger": {"type": "string"}}, "required": ["severity", "where", "defect", "trigger"], "additionalProperties": false}}}, "required": ["findings"], "additionalProperties": false}}}'
+
+          # A fixed cap rather than the model context window, since the free roster rotates and its limits rotate with it
+          limit=120000
+          if [ "$(wc -c < diff.patch)" -gt "$limit" ]; then
+            # Dropping the partial last line is what keeps the cut from landing inside a hunk and handing the model a malformed one
+            head -c "$limit" diff.patch | sed '$d' > diff.head
+            mv diff.head diff.patch
+            instructions="$instructions
+          The diff was truncated before it reached you. Review only what is shown, and say that it was cut."
+          fi
+
+          headers=(-H 'Content-Type: application/json')
+          if [ -n "$auth" ]; then
+            headers+=(-H "$auth")
+          fi
+
+          review=''
+          finish=''
+          for model in "${models[@]}"; do
+            payload=$(jq -n --arg model "$model" --arg instructions "$instructions" --argjson schema "$schema" --rawfile diff diff.patch '{model: $model, max_tokens: 8000, response_format: $schema, messages: [{role: "system", content: $instructions}, {role: "user", content: $diff}]}')
+
+            code=$(curl -sS --max-time 300 -o response.json -w '%{http_code}' "$url" "${headers[@]}" -d "$payload") || code='000'
+            if [ "$code" != '200' ]; then
+              echo "::notice::$model returned HTTP $code"
+              continue
+            fi
+
+            # A model that spends its whole budget reasoning answers 200 with nothing in it, which is a reason to ask the next one rather than to post silence
+            review=$(jq -r '.choices[0].message.content // empty' response.json) || review=''
+            if [ -n "$review" ]; then
+              finish=$(jq -r '.choices[0].finish_reason // empty' response.json) || finish=''
+
+              if printf '%s' "$review" | jq -e 'has("findings") and (.findings | type) == "array"' > /dev/null 2>&1; then
+                break
+              fi
+
+              # JSON of some other shape is a model that ignored the schema rather than one that answered in prose, and `{"content": "[]"}` posted at someone is worse than asking the next model
+              if printf '%s' "$review" | jq -e . > /dev/null 2>&1; then
+                echo "::notice::$model answered with JSON that is not a review"
+                review=''
+                continue
+              fi
+
+              # Something that opens with a brace and does not parse is a broken answer whatever the provider says about why it stopped, and prose does not open with a brace
+              case "$review" in
+                '{'* | '['*)
+                  echo "::notice::$model answered with JSON that will not parse"
+                  review=''
+                  continue
+                  ;;
+              esac
+
+              # Prose is the schema ignored in a way a human can still read, which is worth posting so long as the model reached the end of it
+              if [ "$finish" != 'length' ]; then
+                break
+              fi
+
+              echo "::notice::$model ran out of tokens before finishing its answer"
+              review=''
+              continue
+            fi
+
+            echo "::notice::$model answered with no content"
+          done
+
+          # Not "never fails": a `PROVIDER` this file does not know, or an OpenRouter selected without its key, is a typo that goes red on purpose — and `review` is a required check, so it stops the merge as it should. What cannot fail it is anything the model actually found.
+          disclaimer='Written by a machine. Nothing it finds can fail this check.'
+
+          if [ -z "$review" ]; then
+            # A green check with no comment reads exactly like a clean review, so an outage says so on the pull request rather than only in the log
+            echo '::notice::no model answered'
+            heading="### 🤖 $label could not review this"
+            body='No model answered. The free tier is rate limited per model, so every one of them is either busy or no longer there.'
+            footer="$disclaimer"
+          else
+            heading="### 🤖 $label reviewed this"
+            footer="\`$model\`. $disclaimer"
+
+            # A schema is what was asked for, not what a free model is held to, so anything that will not parse is posted as the prose it came back as
+            if printf '%s' "$review" | jq -e 'has("findings") and (.findings | type) == "array"' > /dev/null 2>&1; then
+              if [ "$(printf '%s' "$review" | jq '.findings | length')" -eq 0 ]; then
+                body='No findings.'
+              else
+                body=$(printf '%s' "$review" | jq -r '.findings[] | "#### \(if .severity == "high" then "🔴" elif .severity == "medium" then "🟠" else "🟡" end) \(.severity) · `\(.where)`\n\n\(.defect)\n\n<sub>**When:** \(.trigger)</sub>\n"')
+              fi
+            else
+              body="$review"
+            fi
+          fi
+
+          {
+            printf '%s\n\n' "$heading"
+            printf '%s\n' "$body"
+
+            # Saying so beats letting a review that stops mid-sentence read as one that finished
+            if [ "$finish" = 'length' ]; then
+              printf '\n_Cut off: the model reached its token limit._\n'
+            fi
+
+            printf '\n---\n<sub>%s</sub>\n' "$footer"
+          } > review.md
+
+          # One comment kept up to date rather than a new one per run; the fallback is for a runner whose `gh` predates --create-if-none
+          gh pr comment "$PR" --body-file review.md --edit-last --create-if-none \
+            || gh pr comment "$PR" --body-file review.md \
+            || echo '::notice::could not post the review'
