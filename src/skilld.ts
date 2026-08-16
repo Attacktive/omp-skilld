@@ -139,14 +139,19 @@ const download = (repo: string, incoming: string, done: string, failed: string, 
 			// Nothing to read back later, which is where a missing complaint is already handled.
 		}
 
-		child = spawn('gh', ['skill', 'install', repo, '--all', '--dir', incoming, '--force'], { stdio: ['ignore', 'ignore', stderr], detached: true });
-
-		if (stderr !== 'ignore') {
-			try {
-				// The child holds its own copy from the moment it was spawned; this one would otherwise be leaked for the life of the launch.
-				closeSync(stderr);
-			} catch {
-				// A descriptor that will not close is a descriptor the launch keeps, which is not worth failing a download over.
+		try {
+			child = spawn('gh', ['skill', 'install', repo, '--all', '--dir', incoming, '--force'], { stdio: ['ignore', 'ignore', stderr], detached: true });
+		} finally {
+			/*
+			 * The child holds its own copy from the moment it was spawned, so this one is closed either way.
+			 * A spawn that threw rather than returning is the reason for the `finally`: nothing downstream has a child to close it, and the refresh above catches the throw — so the launch would carry the descriptor for the rest of its life.
+			 */
+			if (stderr !== 'ignore') {
+				try {
+					closeSync(stderr);
+				} catch {
+					// A descriptor that will not close is a descriptor the launch keeps, which is not worth failing a download over.
+				}
 			}
 		}
 	} else {
