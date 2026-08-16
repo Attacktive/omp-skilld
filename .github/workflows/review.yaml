@@ -10,6 +10,11 @@ on:
         description: 'PR number to review'
         required: true
 
+      # A fallback only reached once the one before it is exhausted is a fallback nothing ever exercises on purpose; naming one here is how its roster gets tested before it is needed
+      providers:
+        description: 'Providers to try, in order — blank for the default'
+        required: false
+
 # One review per pull request, so a re-run supersedes the one it interrupted rather than racing it to the same comment
 concurrency:
   group: review-${{ github.event.pull_request.number || inputs.pull-request }}
@@ -26,45 +31,16 @@ jobs:
       pull-requests: 'write'
 
     env:
-      # 'zen' needs no key at all; 'openrouter' reads OPEN_ROUTER_API_KEY, which need not exist until then
-      PROVIDER: 'zen'
+      # Tried in order, so the one needing no key goes first: 'openrouter' is only reached when every Zen model is busy, and is skipped rather than fatal when its secret is not set
+      PROVIDERS: ${{ inputs.providers || 'zen openrouter' }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GH_REPO: ${{ github.repository }}
-      OPEN_ROUTER_API_KEY: ${{ secrets.OPEN_ROUTER_API_KEY }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
       PR: ${{ github.event.pull_request.number || inputs.pull-request }}
 
     steps:
       - name: 'Review the diff'
         run: |
-          case "$PROVIDER" in
-            zen)
-              url='https://opencode.ai/zen/v1/chat/completions'
-              auth=''
-              label='OpenCode Zen'
-              # The free limit is per model rather than per account, so a list is what turns one model's 429 into a review anyway.
-              # Ordered by what each one did to a diff with known bugs planted in it: the first found every one of them, and the two left out of this list are why the order matters.
-              # `laguna-s-2.1-free` answered "No findings." to that same diff, and a model that green-lights anything is worse here than no review at all; `hy3-free` spends its whole budget reasoning and returns an empty answer.
-              models=('nemotron-3-ultra-free' 'big-pickle' 'deepseek-v4-flash-free' 'mimo-v2.5-free' 'nemotron-3.5-lightning-free')
-              ;;
-            openrouter)
-              # Without this the empty key goes out as `Bearer `, every model answers 401, and a secret nobody set reads as a provider having a bad day
-              if [ -z "$OPEN_ROUTER_API_KEY" ]; then
-                echo '::error::PROVIDER is openrouter but the OPEN_ROUTER_API_KEY secret is not set'
-                exit 1
-              fi
-
-              url='https://openrouter.ai/api/v1/chat/completions'
-              auth="Authorization: Bearer $OPEN_ROUTER_API_KEY"
-              label='OpenRouter'
-              models=('cohere/north-mini-code:free' 'openai/gpt-oss-20b:free')
-              ;;
-            *)
-              # The one failure worth going red for: every other one belongs to the provider, but this one is a typo in this file
-              echo "::error::unknown PROVIDER '$PROVIDER'"
-              exit 1
-              ;;
-          esac
-
           if ! gh pr diff "$PR" > diff.patch; then
             echo '::notice::could not read the diff; leaving the pull request alone'
             exit 0
@@ -97,68 +73,132 @@ jobs:
           The diff was truncated before it reached you. Review only what is shown, and say that it was cut."
           fi
 
-          headers=(-H 'Content-Type: application/json')
-          if [ -n "$auth" ]; then
-            headers+=(-H "$auth")
-          fi
-
           review=''
           finish=''
-          for model in "${models[@]}"; do
-            payload=$(jq -n --arg model "$model" --arg instructions "$instructions" --argjson schema "$schema" --rawfile diff diff.patch '{model: $model, max_tokens: 8000, response_format: $schema, messages: [{role: "system", content: $instructions}, {role: "user", content: $diff}]}')
+          label=''
 
-            code=$(curl -sS --max-time 300 -o response.json -w '%{http_code}' "$url" "${headers[@]}" -d "$payload") || code='000'
-            if [ "$code" != '200' ]; then
-              echo "::notice::$model returned HTTP $code"
-              continue
+          # Whether any provider got as far as being asked. Nothing having been asked at all is a typo in this file rather than a bad day at somebody's API, and that is the one thing here worth going red for.
+          asked=''
+
+          # What was tried, for the comment that has to explain a review nobody wrote
+          tried=''
+
+          # Deliberately unquoted: `PROVIDERS` is a list, and splitting it on whitespace is the whole point
+          for provider in $PROVIDERS; do
+            case "$provider" in
+              zen)
+                url='https://opencode.ai/zen/v1/chat/completions'
+                auth=''
+                label='OpenCode Zen'
+                # The free limit is per model rather than per account, so a list is what turns one model's 429 into a review anyway.
+                # Ordered by what each one did to a diff with known bugs planted in it: the first found every one of them, and the two left out of this list are why the order matters.
+                # `laguna-s-2.1-free` answered "No findings." to that same diff, and a model that green-lights anything is worse here than no review at all; `hy3-free` spends its whole budget reasoning and returns an empty answer.
+                models=('nemotron-3-ultra-free' 'big-pickle' 'deepseek-v4-flash-free' 'mimo-v2.5-free' 'nemotron-3.5-lightning-free')
+                ;;
+              openrouter)
+                # A fallback with no key is a fallback nobody set up, which is a reason to move on rather than to fail the run — and without this the empty key goes out as `Bearer `, every model answers 401, and a secret nobody set reads as a provider having a bad day
+                if [ -z "$OPENROUTER_API_KEY" ]; then
+                  echo '::notice::skipping openrouter: the OPENROUTER_API_KEY secret is not set'
+                  continue
+                fi
+
+                url='https://openrouter.ai/api/v1/chat/completions'
+                auth="Authorization: Bearer $OPENROUTER_API_KEY"
+                label='OpenRouter'
+                # Zen's roster reappears here under its upstream names, so the order follows the same evidence; `poolside/laguna-s-2.1:free` is absent for the same reason its Zen twin is
+                models=('nvidia/nemotron-3-ultra-550b-a55b:free' 'cohere/north-mini-code:free' 'nvidia/nemotron-3-super-120b-a12b:free' 'openai/gpt-oss-20b:free' 'google/gemma-4-31b-it:free')
+                ;;
+              *)
+                # Every other failure here belongs to somebody's API; this one is a typo in this file
+                echo "::error::unknown provider '$provider'"
+                exit 1
+                ;;
+            esac
+
+            asked='yes'
+            if [ -z "$tried" ]; then
+              tried="$label"
+            else
+              tried="$tried, $label"
             fi
 
-            # A model that spends its whole budget reasoning answers 200 with nothing in it, which is a reason to ask the next one rather than to post silence
-            review=$(jq -r '.choices[0].message.content // empty' response.json) || review=''
-            if [ -n "$review" ]; then
-              finish=$(jq -r '.choices[0].finish_reason // empty' response.json) || finish=''
+            headers=(-H 'Content-Type: application/json')
+            if [ -n "$auth" ]; then
+              headers+=(-H "$auth")
+            fi
 
-              if printf '%s' "$review" | jq -e 'has("findings") and (.findings | type) == "array"' > /dev/null 2>&1; then
-                break
-              fi
+            for model in "${models[@]}"; do
+              payload=$(jq -n --arg model "$model" --arg instructions "$instructions" --argjson schema "$schema" --rawfile diff diff.patch '{model: $model, max_tokens: 8000, response_format: $schema, messages: [{role: "system", content: $instructions}, {role: "user", content: $diff}]}')
 
-              # JSON of some other shape is a model that ignored the schema rather than one that answered in prose, and `{"content": "[]"}` posted at someone is worse than asking the next model
-              if printf '%s' "$review" | jq -e . > /dev/null 2>&1; then
-                echo "::notice::$model answered with JSON that is not a review"
-                review=''
+              code=$(curl -sS --max-time 300 -o response.json -w '%{http_code}' "$url" "${headers[@]}" -d "$payload") || code='000'
+              if [ "$code" != '200' ]; then
+                echo "::notice::$label $model returned HTTP $code"
                 continue
               fi
 
-              # Something that opens with a brace and does not parse is a broken answer whatever the provider says about why it stopped, and prose does not open with a brace
-              case "$review" in
-                '{'* | '['*)
-                  echo "::notice::$model answered with JSON that will not parse"
-                  review=''
-                  continue
-                  ;;
-              esac
+              # A model that spends its whole budget reasoning answers 200 with nothing in it, which is a reason to ask the next one rather than to post silence
+              review=$(jq -r '.choices[0].message.content // empty' response.json) || review=''
+              if [ -n "$review" ]; then
+                finish=$(jq -r '.choices[0].finish_reason // empty' response.json) || finish=''
 
-              # Prose is the schema ignored in a way a human can still read, which is worth posting so long as the model reached the end of it
-              if [ "$finish" != 'length' ]; then
-                break
+                if printf '%s' "$review" | jq -e 'has("findings") and (.findings | type) == "array"' > /dev/null 2>&1; then
+                  break
+                fi
+
+                # JSON of some other shape is a model that ignored the schema rather than one that answered in prose, and `{"content": "[]"}` posted at someone is worse than asking the next model
+                if printf '%s' "$review" | jq -e . > /dev/null 2>&1; then
+                  echo "::notice::$label $model answered with JSON that is not a review"
+                  review=''
+                  finish=''
+                  continue
+                fi
+
+                # Something that opens with a brace and does not parse is a broken answer whatever the provider says about why it stopped, and prose does not open with a brace
+                case "$review" in
+                  '{'* | '['*)
+                    echo "::notice::$label $model answered with JSON that will not parse"
+                    review=''
+                    finish=''
+                    continue
+                    ;;
+                esac
+
+                # Prose is the schema ignored in a way a human can still read, which is worth posting so long as the model reached the end of it
+                if [ "$finish" != 'length' ]; then
+                  break
+                fi
+
+                echo "::notice::$label $model ran out of tokens before finishing its answer"
+                review=''
+                # Cleared with the answer it belonged to, or the "could not review" comment inherits it and reports a review nobody wrote as one that was cut off
+                finish=''
+                continue
               fi
 
-              echo "::notice::$model ran out of tokens before finishing its answer"
-              review=''
-              continue
+              echo "::notice::$label $model answered with no content"
+            done
+
+            if [ -n "$review" ]; then
+              break
             fi
 
-            echo "::notice::$model answered with no content"
+            echo "::notice::no $label model answered"
           done
 
-          # Not "never fails": a `PROVIDER` this file does not know, or an OpenRouter selected without its key, is a typo that goes red on purpose — and `review` is a required check, so it stops the merge as it should. What cannot fail it is anything the model actually found.
+          # The one failure worth going red for: a provider list this file cannot act on at all is a typo in it, not somebody's API having a bad day
+          if [ -z "$asked" ]; then
+            echo "::error::no provider in PROVIDERS ('$PROVIDERS') could be tried"
+            exit 1
+          fi
+
+          # Not "never fails": a provider this file does not know, or a list with nothing in it that can be tried, is a typo that goes red on purpose — and `review` is a required check, so it stops the merge as it should. What cannot fail it is anything the model actually found.
           disclaimer='Written by a machine. Nothing it finds can fail this check.'
 
           if [ -z "$review" ]; then
             # A green check with no comment reads exactly like a clean review, so an outage says so on the pull request rather than only in the log
             echo '::notice::no model answered'
-            heading="### 🤖 $label could not review this"
-            body='No model answered. The free tier is rate limited per model, so every one of them is either busy or no longer there.'
+            heading='### 🤖 Nothing could review this'
+            body="No model answered. Tried $tried. The free tiers are rate limited per model, so every one of them is either busy or no longer there."
             footer="$disclaimer"
           else
             heading="### 🤖 $label reviewed this"
