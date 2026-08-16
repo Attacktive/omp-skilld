@@ -118,8 +118,28 @@ jobs:
             if [ -n "$review" ]; then
               finish=$(jq -r '.choices[0].finish_reason // empty' response.json) || finish=''
 
-              # An answer cut off mid-JSON is not an answer: it ends in an unfinished string, renders as nothing, and posting it raw is worse than asking the next model
-              if [ "$finish" != 'length' ] || printf '%s' "$review" | jq -e 'has("findings")' > /dev/null 2>&1; then
+              if printf '%s' "$review" | jq -e 'has("findings") and (.findings | type) == "array"' > /dev/null 2>&1; then
+                break
+              fi
+
+              # JSON of some other shape is a model that ignored the schema rather than one that answered in prose, and `{"content": "[]"}` posted at someone is worse than asking the next model
+              if printf '%s' "$review" | jq -e . > /dev/null 2>&1; then
+                echo "::notice::$model answered with JSON that is not a review"
+                review=''
+                continue
+              fi
+
+              # Something that opens with a brace and does not parse is a broken answer whatever the provider says about why it stopped, and prose does not open with a brace
+              case "$review" in
+                '{'* | '['*)
+                  echo "::notice::$model answered with JSON that will not parse"
+                  review=''
+                  continue
+                  ;;
+              esac
+
+              # Prose is the schema ignored in a way a human can still read, which is worth posting so long as the model reached the end of it
+              if [ "$finish" != 'length' ]; then
                 break
               fi
 
