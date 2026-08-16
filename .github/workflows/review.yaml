@@ -26,6 +26,8 @@ jobs:
       # 'zen' needs no key at all; 'openrouter' reads OPEN_ROUTER_API_KEY, which need not exist until then
       PROVIDER: 'zen'
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Nothing is checked out, so `gh` has no local repository to infer one from
+      GH_REPO: ${{ github.repository }}
       OPEN_ROUTER_API_KEY: ${{ secrets.OPEN_ROUTER_API_KEY }}
       PR: ${{ github.event.pull_request.number || inputs.pull-request }}
 
@@ -43,6 +45,12 @@ jobs:
               models=('nemotron-3-ultra-free' 'big-pickle' 'deepseek-v4-flash-free' 'mimo-v2.5-free' 'nemotron-3.5-lightning-free')
               ;;
             openrouter)
+              # Without this the empty key goes out as `Bearer `, every model answers 401, and a secret nobody set reads as a provider having a bad day
+              if [ -z "$OPEN_ROUTER_API_KEY" ]; then
+                echo '::error::PROVIDER is openrouter but the OPEN_ROUTER_API_KEY secret is not set'
+                exit 1
+              fi
+
               url='https://openrouter.ai/api/v1/chat/completions'
               auth="Authorization: Bearer $OPEN_ROUTER_API_KEY"
               models=('cohere/north-mini-code:free' 'openai/gpt-oss-20b:free')
