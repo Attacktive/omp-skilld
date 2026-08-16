@@ -1,7 +1,8 @@
 name: 'AI PR Review'
 on:
   pull_request:
-    types: ['opened', 'reopened']
+    # `synchronize` costs a request per push, which the per-model free limit can afford, and the comment is edited in place rather than stacked — so a re-review updates the one that is already there
+    types: ['opened', 'reopened', 'synchronize']
   workflow_dispatch:
     inputs:
       pull-request:
@@ -80,7 +81,8 @@ jobs:
           instructions='You are reviewing a pull request for a TypeScript plugin that runs inside a coding agent.
           Report only defects you can point at: correctness bugs, unhandled errors, race conditions, resource leaks, and mistakes that differ between Linux, macOS and Windows.
           Do not summarise the diff, do not praise it, and do not comment on formatting or style.
-          At most five findings, worst first. `where` is the file and the function or symbol in it; `trigger` is the input or state that makes the defect happen.
+          At most three findings, worst first — three is what fits in the budget, and a fourth that arrives cut off in the middle of a word is worth less than nothing.
+          `where` is the file and the function or symbol in it; `trigger` is the input or state that makes the defect happen.
           Be terse: one sentence per field. An empty array if nothing is wrong.'
 
           # Asking for a schema is what keeps these models out of prose: the same diff that produced 266 lines of a model thinking aloud comes back as five findings and a sixth of the tokens.
@@ -117,7 +119,15 @@ jobs:
             review=$(jq -r '.choices[0].message.content // empty' response.json) || review=''
             if [ -n "$review" ]; then
               finish=$(jq -r '.choices[0].finish_reason // empty' response.json) || finish=''
-              break
+
+              # An answer cut off mid-JSON is not an answer: it ends in an unfinished string, renders as nothing, and posting it raw is worse than asking the next model
+              if [ "$finish" != 'length' ] || printf '%s' "$review" | jq -e 'has("findings")' > /dev/null 2>&1; then
+                break
+              fi
+
+              echo "::notice::$model ran out of tokens before finishing its answer"
+              review=''
+              continue
             fi
 
             echo "::notice::$model answered with no content"
