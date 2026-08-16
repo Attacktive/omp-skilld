@@ -1,0 +1,131 @@
+name: 'AI PR Review'
+on:
+  pull_request:
+    types: ['opened', 'reopened']
+  workflow_dispatch:
+    inputs:
+      pull-request:
+        description: 'PR number to review'
+        required: true
+# One review per pull request, so a re-run supersedes the one it interrupted rather than racing it to the same comment
+concurrency:
+  group: 'review-${{ github.event.pull_request.number || inputs.pull-request }}'
+  cancel-in-progress: true
+jobs:
+  review:
+    runs-on: 'ubuntu-latest'
+    # Dependabot's own pull requests auto-merge on green, so reviewing a version bump is a comment nobody reads
+    if: github.actor != 'dependabot[bot]'
+    permissions:
+      # Required to read the diff
+      contents: 'read'
+      # Required to leave the review as a comment
+      pull-requests: 'write'
+
+    env:
+      # 'zen' needs no key at all; 'openrouter' reads OPEN_ROUTER_API_KEY, which need not exist until then
+      PROVIDER: 'zen'
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      OPEN_ROUTER_API_KEY: ${{ secrets.OPEN_ROUTER_API_KEY }}
+      PR: ${{ github.event.pull_request.number || inputs.pull-request }}
+
+    steps:
+      # No actions at all, deliberately: `gh`, `curl` and `jq` are on the runner already, so nothing here has to be pinned, audited or bumped
+      - name: 'Review the diff'
+        run: |
+          case "$PROVIDER" in
+            zen)
+              url='https://opencode.ai/zen/v1/chat/completions'
+              auth=''
+              # The free limit is per model rather than per account, so a list is what turns one model's 429 into a review anyway.
+              # Ordered by what each one did to a diff with known bugs planted in it: the first found every one of them, and the two left out of this list are why the order matters.
+              # `laguna-s-2.1-free` answered "No findings." to that same diff, and a model that green-lights anything is worse here than no review at all; `hy3-free` spends its whole budget reasoning and returns an empty answer.
+              models=('nemotron-3-ultra-free' 'big-pickle' 'deepseek-v4-flash-free' 'mimo-v2.5-free' 'nemotron-3.5-lightning-free')
+              ;;
+            openrouter)
+              url='https://openrouter.ai/api/v1/chat/completions'
+              auth="Authorization: Bearer $OPEN_ROUTER_API_KEY"
+              models=('cohere/north-mini-code:free' 'openai/gpt-oss-20b:free')
+              ;;
+            *)
+              # The one failure worth going red for: every other one belongs to the provider, but this one is a typo in this file
+              echo "::error::unknown PROVIDER '$PROVIDER'"
+              exit 1
+              ;;
+          esac
+
+          if ! gh pr diff "$PR" > diff.patch; then
+            echo '::notice::could not read the diff; leaving the pull request alone'
+            exit 0
+          fi
+
+          # An empty diff reaches the model as no diff at all, and a model given nothing to review answers that it found nothing wrong
+          if [ ! -s diff.patch ]; then
+            echo '::notice::the diff is empty; nothing to review'
+            exit 0
+          fi
+
+          instructions='You are reviewing a pull request for a TypeScript plugin that runs inside a coding agent.
+          Report only defects you can point at: correctness bugs, unhandled errors, race conditions, resource leaks, and mistakes that differ between Linux, macOS and Windows.
+          Give each finding a severity of high, medium or low, name the file and line, and state the concrete input or state that makes it go wrong.
+          Do not summarise the diff, do not praise it, and do not comment on formatting or style.
+          Answer with the findings themselves and nothing else, because narrating your analysis first spends the budget before you reach them.
+          If you find nothing worth reporting, reply with exactly: No findings.'
+
+          # A fixed cap rather than the model context window, since the free roster rotates and its limits rotate with it
+          limit=120000
+          if [ "$(wc -c < diff.patch)" -gt "$limit" ]; then
+            head -c "$limit" diff.patch > diff.head
+            mv diff.head diff.patch
+            instructions="$instructions
+          The diff was truncated before it reached you. Review only what is shown, and say that it was cut."
+          fi
+
+          headers=(-H 'Content-Type: application/json')
+          if [ -n "$auth" ]; then
+            headers+=(-H "$auth")
+          fi
+
+          review=''
+          finish=''
+          for model in "${models[@]}"; do
+            # 8000 rather than something tighter because these models reason in the answer itself: at 4000 the same diff stopped mid-thought before reaching a single finding
+            payload=$(jq -n --arg model "$model" --arg instructions "$instructions" --rawfile diff diff.patch '{model: $model, max_tokens: 8000, messages: [{role: "system", content: $instructions}, {role: "user", content: $diff}]}')
+
+            code=$(curl -sS --max-time 300 -o response.json -w '%{http_code}' "$url" "${headers[@]}" -d "$payload") || code='000'
+            if [ "$code" != '200' ]; then
+              echo "::notice::$model returned HTTP $code"
+              continue
+            fi
+
+            # A model that spends its whole budget reasoning answers 200 with nothing in it, which is a reason to ask the next one rather than to post silence
+            review=$(jq -r '.choices[0].message.content // empty' response.json) || review=''
+            if [ -n "$review" ]; then
+              finish=$(jq -r '.choices[0].finish_reason // empty' response.json) || finish=''
+              break
+            fi
+
+            echo "::notice::$model answered with no content"
+          done
+
+          if [ -z "$review" ]; then
+            echo '::notice::no model answered; leaving the pull request alone'
+            exit 0
+          fi
+
+          # Saying so beats letting a review that stops mid-sentence read as a review that finished
+          if [ "$finish" = 'length' ]; then
+            review="$review
+
+          _Cut off: the model reached its token limit._"
+          fi
+
+          {
+            printf '%s\n' "$review"
+            printf '\n---\n<sub>%s via %s. Advisory only — this check never fails and never blocks a merge.</sub>\n' "$model" "$PROVIDER"
+          } > review.md
+
+          # One comment kept up to date rather than a new one per run; the fallback is for a runner whose `gh` predates --create-if-none
+          gh pr comment "$PR" --body-file review.md --edit-last --create-if-none \
+            || gh pr comment "$PR" --body-file review.md \
+            || echo '::notice::could not post the review'
