@@ -284,7 +284,45 @@ const mtimeMs = (path: string): number | undefined => {
 const staging = (target: string) => {
 	const hidden = `${dirname(target)}/.${basename(target)}`;
 
-	return { incoming: `${hidden}.incoming`, outgoing: `${hidden}.outgoing`, done: `${hidden}.done`, failed: `${hidden}.failed`, pid: `${hidden}.pid` };
+	return { incoming: `${hidden}.incoming`, outgoing: `${hidden}.outgoing`, done: `${hidden}.done`, failed: `${hidden}.failed`, pid: `${hidden}.pid`, noise: `${hidden}.stderr` };
+};
+
+/** As much of `gh`'s complaint as a pin has room for. Long enough for the sentence that explains a failure and the detail under it, short enough that a widget under the editor does not become a wall. */
+const COMPLAINT_LIMIT = 240;
+
+/**
+ * What `gh` said on its way out, as the one line a toast and a pin each have room for.
+ * The end of it rather than the start: a download prints its progress on the same stream, and the reason it stopped comes last.
+ * The last few lines rather than only the last, since a complaint is usually a sentence followed by the detail it is about — `gh` names the skills that collided on the lines under the sentence saying that they did.
+ * `undefined` when it said nothing at all, which leaves the exit code to speak alone rather than trailing it with an empty quote.
+ */
+const complaint = (noise: string): string | undefined => {
+	let said: string;
+	try {
+		said = readFileSync(noise, 'utf8');
+	} catch {
+		// Never written, or already swept: either way there is nothing to repeat.
+		return undefined;
+	}
+
+	// Carriage returns break a line the same way newlines do: that is how a progress spinner writes over itself, and left whole a download would arrive as one line holding every frame of it.
+	const lines = said.split(/[\r\n]+/)
+		.map((line) => line.trim())
+		.filter((line) => line.length > 0);
+
+	if (lines.length === 0) {
+		return undefined;
+	}
+
+	const tail = lines.slice(-3)
+		.join(' · ');
+
+	if (tail.length <= COMPLAINT_LIMIT) {
+		return tail;
+	}
+
+	// Cut at the front for the same reason the last lines are the ones kept: `gh` prints its hint — an absolute path long enough to spend the whole budget alone — before the sentence that says what actually went wrong.
+	return `…${tail.slice(-COMPLAINT_LIMIT)}`;
 };
 
 /** Single-quoted for the shell that wraps `gh`, with any quote in the text closed, escaped and reopened the way `sh` requires. */
@@ -293,9 +331,10 @@ const q = (text: string) => `'${text.replaceAll('\'', `'\\''`)}'`;
 /**
  * The download, wrapped so that something which outlives this process records how it ended: the launch that started it may well be gone before it finishes, and the next one reads the markers it left.
  * The shell's own verdicts are exempt from the failure marker — a `gh` that was never found, or never ran, spent none of the rate limit the cooldown exists to protect, so installing it and relaunching works at once instead of after an hour.
+ * `gh`'s stderr is kept rather than discarded: an exit code says a download failed and only `gh` can say why, and that stream is where it says so. The redirection truncates on every attempt, so what is read back is always this download's account of itself.
  * Both markers are written with `:` and a redirection rather than `touch`, so nothing here depends on what is on `PATH` beyond `gh` itself.
  */
-const installCommand = (repo: string, incoming: string, done: string, failed: string) => `gh skill install ${q(repo)} --all --dir ${q(incoming)} --force; rc=$?; if [ "$rc" -eq 0 ]; then : > ${q(done)}; elif [ "$rc" -ne ${NOT_FOUND} ] && [ "$rc" -ne ${NOT_EXECUTABLE} ]; then : > ${q(failed)}; fi; exit "$rc"`;
+const installCommand = (repo: string, incoming: string, done: string, failed: string, noise: string) => `gh skill install ${q(repo)} --all --dir ${q(incoming)} --force 2> ${q(noise)}; rc=$?; if [ "$rc" -eq 0 ]; then : > ${q(done)}; elif [ "$rc" -ne ${NOT_FOUND} ] && [ "$rc" -ne ${NOT_EXECUTABLE} ]; then : > ${q(failed)}; fi; exit "$rc"`;
 
 /**
  * Stands a finished download in for the live directory, so a half-written one is never what omp scans.
@@ -661,4 +700,4 @@ const readPluginSettings = async (cwd: string): Promise<{ options: Record<string
 	}
 };
 
-export { DEFAULT_INTERVAL_MS, ANNOUNCEMENT_DELAY_MS, DEFAULT_PLACEHOLDER, ABANDONED_MS, FAILURE_COOLDOWN_MS, NOT_FOUND, NOT_EXECUTABLE, PLUGIN_NAME, type SkillRepository, type SkillSource, type Options, type NormalizedSource, type StagingState, type Layout, slugify, reason, expand, asInterval, asPlaceholder, asSources, isRepo, isSource, layout, normalize, staging, installCommand, settleParked, swap, isStale, isEmpty, dropPlaceholder, linkSkills, unlink, resolveStaging, readPluginSettings };
+export { DEFAULT_INTERVAL_MS, ANNOUNCEMENT_DELAY_MS, DEFAULT_PLACEHOLDER, ABANDONED_MS, FAILURE_COOLDOWN_MS, NOT_FOUND, NOT_EXECUTABLE, PLUGIN_NAME, type SkillRepository, type SkillSource, type Options, type NormalizedSource, type StagingState, type Layout, slugify, reason, complaint, expand, asInterval, asPlaceholder, asSources, isRepo, isSource, layout, normalize, staging, installCommand, settleParked, swap, isStale, isEmpty, dropPlaceholder, linkSkills, unlink, resolveStaging, readPluginSettings };

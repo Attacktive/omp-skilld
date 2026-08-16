@@ -7,7 +7,7 @@ import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import * as pluginModule from './skilld.ts';
 import plugin from './skilld.ts';
-import { ABANDONED_MS, DEFAULT_INTERVAL_MS, FAILURE_COOLDOWN_MS, NOT_EXECUTABLE, NOT_FOUND, PLUGIN_NAME, asInterval, asPlaceholder, asSources, dropPlaceholder, expand, installCommand, isEmpty, isRepo, isSource, isStale, layout, linkSkills, normalize, unlink, readPluginSettings, resolveStaging, settleParked, slugify, staging, swap, sweepGuard } from './internals.ts';
+import { ABANDONED_MS, DEFAULT_INTERVAL_MS, FAILURE_COOLDOWN_MS, NOT_EXECUTABLE, NOT_FOUND, PLUGIN_NAME, asInterval, asPlaceholder, asSources, complaint, dropPlaceholder, expand, installCommand, isEmpty, isRepo, isSource, isStale, layout, linkSkills, normalize, unlink, readPluginSettings, resolveStaging, settleParked, slugify, staging, swap, sweepGuard } from './internals.ts';
 
 const INTERVAL_MS = 24 * 60 * 60 * 1000;
 
@@ -619,7 +619,70 @@ test(
 test(
 	'staging hides both directories beside the target, so a scan ignores them and the swap stays a rename',
 	() => expect(staging('/skills/anthropic'))
-		.toEqual({ incoming: '/skills/.anthropic.incoming', outgoing: '/skills/.anthropic.outgoing', done: '/skills/.anthropic.done', failed: '/skills/.anthropic.failed', pid: '/skills/.anthropic.pid' })
+		.toEqual({ incoming: '/skills/.anthropic.incoming', outgoing: '/skills/.anthropic.outgoing', done: '/skills/.anthropic.done', failed: '/skills/.anthropic.failed', pid: '/skills/.anthropic.pid', noise: '/skills/.anthropic.stderr' })
+);
+
+/** Plants what a download left on `gh`'s stderr, and hands back the path the plugin reads it from. */
+const grumbled = (name: string, said: string) => {
+	const { noise } = staging(join(scratch, name));
+
+	writeFileSync(noise, said);
+
+	return noise;
+};
+
+test(
+	'a download that failed without a word leaves the exit code to speak alone, rather than trailing it with an empty quote',
+	() => expect(complaint(grumbled('quiet-failure', '\n   \n')))
+		.toBeUndefined()
+);
+
+test(
+	'a download that never wrote a stderr file at all is the same silence, not a failure to read one',
+	() => expect(complaint(join(scratch, 'never-grumbled.stderr')))
+		.toBeUndefined()
+);
+
+test(
+	'a complaint is the end of what was said rather than the start, since a download prints its progress on the same stream and the reason it stopped comes last',
+	() => expect(complaint(grumbled('noisy-failure', 'Fetching skills\nResolving anthropics/skills\ncannot install skills with conflicting names:\n  pdf (anthropics/skills)\n  pdf (someone/theirs)\n')))
+		.toBe('cannot install skills with conflicting names: · pdf (anthropics/skills) · pdf (someone/theirs)')
+);
+
+test(
+	'a spinner writes over itself with carriage returns, which break a line the same way, or a whole download would arrive as one',
+	() => expect(complaint(grumbled('spinner-failure', 'fetching\rdownloading 1%\rdownloading 99%\rerror: HTTP 401\n')))
+		.toBe('downloading 1% · downloading 99% · error: HTTP 401')
+);
+
+test(
+	'a download that failed at length is cut to what a pin can hold, since a stack trace under the editor is worse than no reason at all',
+	() => {
+		const said = complaint(grumbled('verbose-failure', `${'chatter '.repeat(200)}\n`));
+
+		expect(said?.length)
+			.toBeLessThan(300);
+
+		expect(said)
+			.toStartWith('…');
+	}
+);
+
+test(
+	'a complaint too long to fit is cut at the front, since `gh` prints its hint before the reason and it is the reason that has to survive the cut',
+	() => {
+		// What `gh` 2.97 really answers when two skills in one repository share a name: the hint comes first, and its absolute path is long enough to spend the whole budget on its own.
+		const said = complaint(grumbled(
+			'collision-failure',
+			`Hint: install individually using the full name: gh skill install ${'/a-rather-long-path-segment'.repeat(8)} namespace/skill-name\ncannot install skills with conflicting names; they would overwrite each other:\n  pdf: engineering/pdf, writing/pdf\n`
+		));
+
+		expect(said)
+			.toEndWith('cannot install skills with conflicting names; they would overwrite each other: · pdf: engineering/pdf, writing/pdf');
+
+		expect(said)
+			.toStartWith('…');
+	}
 );
 
 /** A staging area as an earlier launch would have left it: the download, plus whatever marker recorded how it ended. */
@@ -810,7 +873,7 @@ test(
 const runInstall = (name: string, gh?: { script: string; mode: number }) => {
 	const home = join(scratch, name);
 	const bin = join(home, 'bin');
-	const { incoming, done, failed } = staging(join(home, 'target'));
+	const { incoming, done, failed, noise } = staging(join(home, 'target'));
 
 	mkdirSync(bin, { recursive: true });
 
@@ -821,7 +884,7 @@ const runInstall = (name: string, gh?: { script: string; mode: number }) => {
 		chmodSync(path, gh.mode);
 	}
 
-	const { status, error } = spawnSync('/bin/sh', ['-c', installCommand('anthropics/skills', incoming, done, failed)], { env: { PATH: bin }, stdio: 'ignore' });
+	const { status, error } = spawnSync('/bin/sh', ['-c', installCommand('anthropics/skills', incoming, done, failed, noise)], { env: { PATH: bin }, stdio: 'ignore' });
 
 	if (error !== undefined) {
 		throw error;
@@ -922,6 +985,41 @@ onPosix(
 			.toBe(false);
 
 		expect(existsSync(stamp))
+			.toBe(false);
+	}
+);
+
+onPosix(
+	'a refresh whose `gh` said why it failed repeats what it said, since an exit code on its own is not a reason',
+	async () => {
+		const { heard, board, settleDownload } = await refreshWith(
+			'e2e-complaint',
+			'echo "cannot install skills with conflicting names: pdf" >&2\nexit 1\n'
+		);
+
+		// The failure marker is the wrapper's doing and lands before the exit handler speaks; what this case is waiting on is the speaking.
+		await settleDownload(() => heard.some((toast) => toast.type === 'error'));
+
+		expect(heard.some((toast) => toast.type === 'error' && toast.message.includes('conflicting names: pdf')))
+			.toBe(true);
+
+		expect(board.widgets[`${PLUGIN_NAME}:e2e-complaint`]?.join('\n'))
+			.toContain('conflicting names: pdf');
+	}
+);
+
+onPosix(
+	'a refresh that succeeded takes the grumbling with it, since a complaint left lying beside a working install is one a later failure would repeat as its own',
+	async () => {
+		// `gh` warns and installs anyway, which is the case that leaves a complaint behind a success.
+		const { settleDownload, target, stamp } = await refreshWith(
+			'e2e-grumbled-success',
+			'echo "warning: skill `pdf` was already up to date" >&2\nmkdir -p "$6/grumbled-skill"\necho done > "$6/grumbled-skill/SKILL.md"\nexit 0\n'
+		);
+
+		await settleDownload(() => existsSync(stamp));
+
+		expect(existsSync(staging(target).noise))
 			.toBe(false);
 	}
 );

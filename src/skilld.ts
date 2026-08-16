@@ -9,10 +9,10 @@
 
 import type { ExtensionAPI, ExtensionContext } from '@oh-my-pi/pi-coding-agent';
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { ANNOUNCEMENT_DELAY_MS, DEFAULT_INTERVAL_MS, NOT_EXECUTABLE, NOT_FOUND, PLUGIN_NAME, asInterval, reason, asSources, dropPlaceholder, installCommand, isEmpty, isSource, isStale, layout, linkSkills, normalize, readPluginSettings, resolveStaging, settleParked, staging, swap, sweepGuard, type Layout, type NormalizedSource, type Options, type SkillSource, type StagingState } from './internals.ts';
+import { ANNOUNCEMENT_DELAY_MS, DEFAULT_INTERVAL_MS, NOT_EXECUTABLE, NOT_FOUND, PLUGIN_NAME, asInterval, complaint, reason, asSources, dropPlaceholder, installCommand, isEmpty, isSource, isStale, layout, linkSkills, normalize, readPluginSettings, resolveStaging, settleParked, staging, swap, sweepGuard, type Layout, type NormalizedSource, type Options, type SkillSource, type StagingState } from './internals.ts';
 
 /** Exhaustive against {@link Options} by construction: a key added there refuses to compile until it is mirrored here. */
 const KNOWN_OPTIONS: Record<keyof Options, null> = { sources: null, interval: null };
@@ -123,13 +123,34 @@ let sessionVoice: Voice | undefined;
  * A shell wraps `gh` only so that something which outlives this process can record how the download ended; the plugin's own handlers die with the parent.
  * Windows does not reap children with their parent, so there `gh` is spawned directly and the markers are the launch's own business.
  */
-const download = (repo: string, incoming: string, done: string, failed: string, pid: string) => {
+const download = (repo: string, incoming: string, done: string, failed: string, pid: string, noise: string) => {
 	let child;
 
 	if (process.platform === 'win32') {
-		child = spawn('gh', ['skill', 'install', repo, '--all', '--dir', incoming, '--force'], { stdio: 'ignore', detached: true });
+		/*
+		 * Where the shell's `2>` does the same job everywhere else: an exit code says a download failed, and only `gh` can say why.
+		 * A file that will not open costs the explanation and nothing more, so the download still goes ahead with the stream discarded.
+		 */
+		let stderr: number | 'ignore' = 'ignore';
+
+		try {
+			stderr = openSync(noise, 'w');
+		} catch {
+			// Nothing to read back later, which is where a missing complaint is already handled.
+		}
+
+		child = spawn('gh', ['skill', 'install', repo, '--all', '--dir', incoming, '--force'], { stdio: ['ignore', 'ignore', stderr], detached: true });
+
+		if (stderr !== 'ignore') {
+			try {
+				// The child holds its own copy from the moment it was spawned; this one would otherwise be leaked for the life of the launch.
+				closeSync(stderr);
+			} catch {
+				// A descriptor that will not close is a descriptor the launch keeps, which is not worth failing a download over.
+			}
+		}
 	} else {
-		child = spawn('sh', ['-c', installCommand(repo, incoming, done, failed)], { stdio: 'ignore', detached: true });
+		child = spawn('sh', ['-c', installCommand(repo, incoming, done, failed, noise)], { stdio: 'ignore', detached: true });
 	}
 
 	/*
@@ -178,7 +199,7 @@ const publish = (source: NormalizedSource, linkRoot: string, voice: Voice, log: 
 /** A finished download becomes the live directory, its stamp is recorded, and the completion markers make way for the next refresh. Shared by the in-process exit handler and the launch that finds a finished download left behind by a dead one. */
 const complete = (source: NormalizedSource, dirs: Layout, voice: Voice, log: Log) => {
 	const { target, stamp } = source;
-	const { incoming, done, failed, pid } = staging(target);
+	const { incoming, done, failed, pid, noise } = staging(target);
 
 	/*
 	 * Unlinking the marker is how a launch claims the download: two started close enough together both find it finished, and only one unlink can succeed.
@@ -235,6 +256,9 @@ const complete = (source: NormalizedSource, dirs: Layout, voice: Voice, log: Log
 
 	rmSync(failed, { force: true });
 	rmSync(pid, { force: true });
+
+	// Whatever `gh` grumbled on its way to succeeding is spent news, and a complaint left lying beside a working install is one a later failure would repeat as its own.
+	rmSync(noise, { force: true });
 
 	const published = publish(source, dirs.linkRoot, voice, log);
 
@@ -293,7 +317,7 @@ const refresh = (configured: SkillSource, dirs: Layout, staleAfter: number, voic
 		label = source.label;
 
 		const { repo, target, stamp } = source;
-		const { incoming, done, failed, pid } = staging(target);
+		const { incoming, done, failed, pid, noise } = staging(target);
 
 		/*
 		 * Only the parent, which is where staging goes.
@@ -339,7 +363,7 @@ const refresh = (configured: SkillSource, dirs: Layout, staleAfter: number, voic
 		 */
 		notice = ctx.setTimeout(() => voice.toast(announcement, 'info'), ANNOUNCEMENT_DELAY_MS);
 
-		const install = download(repo, incoming, done, failed, pid);
+		const install = download(repo, incoming, done, failed, pid, noise);
 
 		log(`${label}: downloading into ${incoming}`);
 
@@ -384,6 +408,19 @@ const refresh = (configured: SkillSource, dirs: Layout, staleAfter: number, voic
 			}
 		};
 
+		/**
+		 * The same failure with `gh`'s own account of it appended, when it left one.
+		 * An exit code says a download failed; a name that collided, a login that expired, a repository that is not there are all things only `gh` can say, and it says them on the stream the download kept.
+		 */
+		const withComplaint = (detail: string) => {
+			const said = complaint(noise);
+			if (said === undefined) {
+				return detail;
+			}
+
+			return `${detail}: ${said}`;
+		};
+
 		/** Every way a download that did start can fail: the log gets the detail, the toast gets the same detail in parentheses, and the pin holds it until it has been seen. */
 		const speakOnFailure = (detail: string) => () => {
 			log(`${label}: ${detail}`);
@@ -409,7 +446,7 @@ const refresh = (configured: SkillSource, dirs: Layout, staleAfter: number, voic
 
 		const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
 			if (signal !== null) {
-				const speak = speakOnFailure(`\`gh\` was killed by ${signal}`);
+				const speak = speakOnFailure(withComplaint(`\`gh\` was killed by ${signal}`));
 
 				finish(() => {
 					// A killed download leaves a half-written directory nothing will ever finish; sweeping it now spares the next launch the abandonment clock.
@@ -428,7 +465,7 @@ const refresh = (configured: SkillSource, dirs: Layout, staleAfter: number, voic
 			}
 
 			if (code !== 0) {
-				const speak = speakOnFailure(`\`gh\` exited with code ${code}`);
+				const speak = speakOnFailure(withComplaint(`\`gh\` exited with code ${code}`));
 
 				finish(() => {
 					/*
