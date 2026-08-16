@@ -3,39 +3,37 @@ on:
   pull_request:
     # `synchronize` costs a request per push, which the per-model free limit can afford, and the comment is edited in place rather than stacked — so a re-review updates the one that is already there
     types: ['opened', 'reopened', 'synchronize']
+
   workflow_dispatch:
     inputs:
       pull-request:
         description: 'PR number to review'
         required: true
+
 # One review per pull request, so a re-run supersedes the one it interrupted rather than racing it to the same comment
 concurrency:
-  group: 'review-${{ github.event.pull_request.number || inputs.pull-request }}'
+  group: review-${{ github.event.pull_request.number || inputs.pull-request }}
   cancel-in-progress: true
+
 jobs:
   review:
     runs-on: 'ubuntu-latest'
     # Five models at five minutes each is the worst case the retry loop allows, and a run that passes it is hung rather than slow
     timeout-minutes: 30
-    # Dependabot's own pull requests auto-merge on green, so reviewing a version bump is a comment nobody reads
     if: github.actor != 'dependabot[bot]'
     permissions:
-      # Required to read the diff
       contents: 'read'
-      # Required to leave the review as a comment
       pull-requests: 'write'
 
     env:
       # 'zen' needs no key at all; 'openrouter' reads OPEN_ROUTER_API_KEY, which need not exist until then
       PROVIDER: 'zen'
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      # Nothing is checked out, so `gh` has no local repository to infer one from
       GH_REPO: ${{ github.repository }}
       OPEN_ROUTER_API_KEY: ${{ secrets.OPEN_ROUTER_API_KEY }}
       PR: ${{ github.event.pull_request.number || inputs.pull-request }}
 
     steps:
-      # No actions at all, deliberately: `gh`, `curl` and `jq` are on the runner already, so nothing here has to be pinned, audited or bumped
       - name: 'Review the diff'
         run: |
           case "$PROVIDER" in
