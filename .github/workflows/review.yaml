@@ -14,6 +14,8 @@ concurrency:
 jobs:
   review:
     runs-on: 'ubuntu-latest'
+    # Five models at five minutes each is the worst case the retry loop allows, and a run that passes it is hung rather than slow
+    timeout-minutes: 30
     # Dependabot's own pull requests auto-merge on green, so reviewing a version bump is a comment nobody reads
     if: github.actor != 'dependabot[bot]'
     permissions:
@@ -39,6 +41,7 @@ jobs:
             zen)
               url='https://opencode.ai/zen/v1/chat/completions'
               auth=''
+              label='OpenCode Zen'
               # The free limit is per model rather than per account, so a list is what turns one model's 429 into a review anyway.
               # Ordered by what each one did to a diff with known bugs planted in it: the first found every one of them, and the two left out of this list are why the order matters.
               # `laguna-s-2.1-free` answered "No findings." to that same diff, and a model that green-lights anything is worse here than no review at all; `hy3-free` spends its whole budget reasoning and returns an empty answer.
@@ -53,6 +56,7 @@ jobs:
 
               url='https://openrouter.ai/api/v1/chat/completions'
               auth="Authorization: Bearer $OPEN_ROUTER_API_KEY"
+              label='OpenRouter'
               models=('cohere/north-mini-code:free' 'openai/gpt-oss-20b:free')
               ;;
             *)
@@ -75,10 +79,13 @@ jobs:
 
           instructions='You are reviewing a pull request for a TypeScript plugin that runs inside a coding agent.
           Report only defects you can point at: correctness bugs, unhandled errors, race conditions, resource leaks, and mistakes that differ between Linux, macOS and Windows.
-          Give each finding a severity of high, medium or low, name the file and line, and state the concrete input or state that makes it go wrong.
           Do not summarise the diff, do not praise it, and do not comment on formatting or style.
-          Answer with the findings themselves and nothing else, because narrating your analysis first spends the budget before you reach them.
-          If you find nothing worth reporting, reply with exactly: No findings.'
+          At most five findings, worst first. `where` is the file and the function or symbol in it; `trigger` is the input or state that makes the defect happen.
+          Be terse: one sentence per field. An empty array if nothing is wrong.'
+
+          # Asking for a schema is what keeps these models out of prose: the same diff that produced 266 lines of a model thinking aloud comes back as five findings and a sixth of the tokens.
+          # No `line` field on purpose — it is the one these models invent, and it was garbage in the JSON besides.
+          schema='{"type": "json_schema", "json_schema": {"name": "review", "strict": true, "schema": {"type": "object", "properties": {"findings": {"type": "array", "items": {"type": "object", "properties": {"severity": {"type": "string", "enum": ["high", "medium", "low"]}, "where": {"type": "string"}, "defect": {"type": "string"}, "trigger": {"type": "string"}}, "required": ["severity", "where", "defect", "trigger"], "additionalProperties": false}}}, "required": ["findings"], "additionalProperties": false}}}'
 
           # A fixed cap rather than the model context window, since the free roster rotates and its limits rotate with it
           limit=120000
@@ -97,8 +104,7 @@ jobs:
           review=''
           finish=''
           for model in "${models[@]}"; do
-            # 8000 rather than something tighter because these models reason in the answer itself: at 4000 the same diff stopped mid-thought before reaching a single finding
-            payload=$(jq -n --arg model "$model" --arg instructions "$instructions" --rawfile diff diff.patch '{model: $model, max_tokens: 8000, messages: [{role: "system", content: $instructions}, {role: "user", content: $diff}]}')
+            payload=$(jq -n --arg model "$model" --arg instructions "$instructions" --argjson schema "$schema" --rawfile diff diff.patch '{model: $model, max_tokens: 8000, response_format: $schema, messages: [{role: "system", content: $instructions}, {role: "user", content: $diff}]}')
 
             code=$(curl -sS --max-time 300 -o response.json -w '%{http_code}' "$url" "${headers[@]}" -d "$payload") || code='000'
             if [ "$code" != '200' ]; then
@@ -121,16 +127,27 @@ jobs:
             exit 0
           fi
 
-          # Saying so beats letting a review that stops mid-sentence read as a review that finished
-          if [ "$finish" = 'length' ]; then
-            review="$review
-
-          _Cut off: the model reached its token limit._"
+          # A schema is what was asked for, not what a free model is held to, so anything that will not parse is posted as the prose it came back as
+          if printf '%s' "$review" | jq -e 'has("findings") and (.findings | type) == "array"' > /dev/null 2>&1; then
+            if [ "$(printf '%s' "$review" | jq '.findings | length')" -eq 0 ]; then
+              body='No findings.'
+            else
+              body=$(printf '%s' "$review" | jq -r '.findings[] | "#### \(if .severity == "high" then "🔴" elif .severity == "medium" then "🟠" else "🟡" end) \(.severity) · `\(.where)`\n\n\(.defect)\n\n<sub>**When:** \(.trigger)</sub>\n"')
+            fi
+          else
+            body="$review"
           fi
 
           {
-            printf '%s\n' "$review"
-            printf '\n---\n<sub>%s via %s. Advisory only — this check never fails and never blocks a merge.</sub>\n' "$model" "$PROVIDER"
+            printf '### %s reviewed this\n\n' "$label"
+            printf '%s\n' "$body"
+
+            # Saying so beats letting a review that stops mid-sentence read as one that finished
+            if [ "$finish" = 'length' ]; then
+              printf '\n_Cut off: the model reached its token limit._\n'
+            fi
+
+            printf '\n---\n<sub>`%s`. Advisory only — this check never fails and never blocks a merge.</sub>\n' "$model"
           } > review.md
 
           # One comment kept up to date rather than a new one per run; the fallback is for a runner whose `gh` predates --create-if-none
