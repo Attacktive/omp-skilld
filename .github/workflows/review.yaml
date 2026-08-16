@@ -151,7 +151,8 @@ jobs:
             echo "::notice::$model answered with no content"
           done
 
-          disclaimer='Written by a machine, and advisory only — this check never fails and never blocks a merge.'
+          # Not "never fails": a `PROVIDER` this file does not know, or an OpenRouter selected without its key, is a typo that goes red on purpose — and `review` is a required check, so it stops the merge as it should. What cannot fail it is anything the model actually found.
+          disclaimer='Written by a machine. Nothing it finds can fail this check.'
 
           if [ -z "$review" ]; then
             # A green check with no comment reads exactly like a clean review, so an outage says so on the pull request rather than only in the log
