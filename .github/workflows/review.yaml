@@ -23,8 +23,9 @@ concurrency:
 jobs:
   review:
     runs-on: 'ubuntu-latest'
-    # Five models at five minutes each is the worst case the retry loop allows, and a run that passes it is hung rather than slow
-    timeout-minutes: 30
+    # Nine models at the five-minute request timeout each is the worst case two providers allow, and a run past that is hung rather than slow.
+    # Generous on purpose: this is a required check, so a job killed for being slow goes red and blocks a merge — which is the one thing a review that cannot fail anything must never do.
+    timeout-minutes: 60
     if: github.actor != 'dependabot[bot]'
     permissions:
       contents: 'read'
@@ -105,8 +106,11 @@ jobs:
                 url='https://openrouter.ai/api/v1/chat/completions'
                 auth="Authorization: Bearer $OPENROUTER_API_KEY"
                 label='OpenRouter'
-                # Zen's roster reappears here under its upstream names, so the order follows the same evidence; `poolside/laguna-s-2.1:free` is absent for the same reason its Zen twin is
-                models=('nvidia/nemotron-3-ultra-550b-a55b:free' 'cohere/north-mini-code:free' 'nvidia/nemotron-3-super-120b-a12b:free' 'openai/gpt-oss-20b:free' 'google/gemma-4-31b-it:free')
+                # Ordered by a dispatched run against a real diff: `nemotron-3-super-120b` answered it against the schema, and `north-mini-code` answered with nothing, which is why it sits at the back.
+                # The middle two are untested and placed on nothing better than a guess — the run never reached them, since the one in front of them answered.
+                # `nvidia/nemotron-3-ultra-550b-a55b:free` is absent because it spent the whole 300s request timeout and returned nothing at all; at the front of this list it cost that run five minutes before it tried anything else.
+                # `poolside/laguna-s-2.1:free` is absent for the same reason its Zen twin is.
+                models=('nvidia/nemotron-3-super-120b-a12b:free' 'openai/gpt-oss-20b:free' 'google/gemma-4-31b-it:free' 'cohere/north-mini-code:free')
                 ;;
               *)
                 # Every other failure here belongs to somebody's API; this one is a typo in this file
