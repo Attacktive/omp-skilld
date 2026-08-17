@@ -81,6 +81,9 @@ jobs:
           # Whether any provider got as far as being asked. Nothing having been asked at all is a typo in this file rather than a bad day at somebody's API, and that is the one thing here worth going red for.
           asked=''
 
+          # Whether any model got as far as returning a 200. A review nobody wrote has two very different causes, and the comment that has to explain it should not guess at which one it was.
+          heard=''
+
           # What was tried, for the comment that has to explain a review nobody wrote
           tried=''
 
@@ -95,6 +98,9 @@ jobs:
                 # Ordered by what each one did to a diff with known bugs planted in it: the first found every one of them, and the two left out of this list are why the order matters.
                 # `laguna-s-2.1-free` answered "No findings." to that same diff, and a model that green-lights anything is worse here than no review at all; `hy3-free` spends its whole budget reasoning and returns an empty answer.
                 models=('nemotron-3-ultra-free' 'big-pickle' 'deepseek-v4-flash-free' 'mimo-v2.5-free' 'nemotron-3.5-lightning-free')
+                # The budget this roster was tuned against, and nothing extra in the payload: an unknown field is a 400 away from taking down the provider that already works
+                budget=8000
+                extra='{}'
                 ;;
               openrouter)
                 # A fallback with no key is a fallback nobody set up, which is a reason to move on rather than to fail the run — and without this the empty key goes out as `Bearer `, every model answers 401, and a secret nobody set reads as a provider having a bad day
@@ -109,6 +115,10 @@ jobs:
                 # `openrouter/free` is a router rather than a model: it picks a free model at random and filters to ones that support the parameters actually being sent, `response_format` and `structured_outputs` among them — which is the guarantee a hand-picked list cannot give, since the free roster rotates and takes schema support with it.
                 # That makes it the whole reason this list is two entries instead of a roster to maintain. `nemotron-3-super-120b` stays behind it as the one model a dispatched run against a real diff saw answer against the schema.
                 models=('openrouter/free' 'nvidia/nemotron-3-super-120b-a12b:free')
+                # Reasoning tokens are spent out of the same budget as the answer, and a free model that thinks its way through a diff reaches the end of the budget before it reaches the review — which is how both of these came back cut off mid-sentence with the schema ignored.
+                # `enabled: false` rather than `exclude: true`: excluding only hides the thinking from the response, it still pays for it. The larger budget is the backstop for a model that reasons whatever it is told.
+                budget=16000
+                extra='{"reasoning": {"enabled": false}}'
                 ;;
               *)
                 # Every other failure here belongs to somebody's API; this one is a typo in this file
@@ -130,13 +140,16 @@ jobs:
             fi
 
             for model in "${models[@]}"; do
-              payload=$(jq -n --arg model "$model" --arg instructions "$instructions" --argjson schema "$schema" --rawfile diff diff.patch '{model: $model, max_tokens: 8000, response_format: $schema, messages: [{role: "system", content: $instructions}, {role: "user", content: $diff}]}')
+              payload=$(jq -n --arg model "$model" --arg instructions "$instructions" --argjson schema "$schema" --argjson budget "$budget" --argjson extra "$extra" --rawfile diff diff.patch '{model: $model, max_tokens: $budget, response_format: $schema, messages: [{role: "system", content: $instructions}, {role: "user", content: $diff}]} + $extra')
 
               code=$(curl -sS --max-time 300 -o response.json -w '%{http_code}' "$url" "${headers[@]}" -d "$payload") || code='000'
               if [ "$code" != '200' ]; then
                 echo "::notice::$label $model returned HTTP $code"
                 continue
               fi
+
+              # Somebody was home. Whatever goes wrong from here is the answer's fault rather than the provider's, and the comment says so rather than blaming a rate limit nobody hit.
+              heard='yes'
 
               # A model that spends its whole budget reasoning answers 200 with nothing in it, which is a reason to ask the next one rather than to post silence
               review=$(jq -r '.choices[0].message.content // empty' response.json) || review=''
@@ -200,7 +213,14 @@ jobs:
             # A green check with no comment reads exactly like a clean review, so an outage says so on the pull request rather than only in the log
             echo '::notice::no model answered'
             heading='### 🤖 Nothing could review this'
-            body="No model answered. Tried $tried. The free tiers are rate limited per model, so every one of them is either busy or no longer there."
+
+            # A model that answered badly and a provider that never answered look identical from here, and reporting the second when it was the first sends whoever reads this to check a rate limit nobody hit
+            if [ -n "$heard" ]; then
+              body="Tried $tried. Every model that answered gave something that could not be posted: cut off, empty, or not the review that was asked for."
+            else
+              body="No model answered. Tried $tried. The free tiers are rate limited per model, so every one of them is either busy or no longer there."
+            fi
+
             footer="$disclaimer"
           else
             heading="### 🤖 $label reviewed this"
