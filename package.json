@@ -1,6 +1,6 @@
 {
 	"name": "omp-skilld",
-	"version": "1.0.0",
+	"version": "1.0.1",
 	"description": "An unofficial OMP plugin that refreshes skills from GitHub repositories in the background",
 	"license": "MIT",
 	"type": "module",
