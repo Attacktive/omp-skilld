@@ -87,8 +87,11 @@ jobs:
           # What was tried, for the comment that has to explain a review nobody wrote
           tried=''
 
-          # Deliberately unquoted: `PROVIDERS` is a list, and splitting it on whitespace is the whole point
-          for provider in $PROVIDERS; do
+          # `read -ra` rather than a bare `$PROVIDERS`: splitting the list on whitespace is the whole point, but pathname expansion is not, and an unquoted one does both.
+          # Dispatching `providers: '*'` otherwise expands to the working directory and the run goes red complaining about a provider called `bin`.
+          read -ra wanted <<< "$PROVIDERS"
+
+          for provider in "${wanted[@]}"; do
             case "$provider" in
               zen)
                 url='https://opencode.ai/zen/v1/chat/completions'
