@@ -64,6 +64,10 @@ jobs:
           # No `line` field on purpose — it is the one these models invent, and it was garbage in the JSON besides.
           schema='{"type": "json_schema", "json_schema": {"name": "review", "strict": true, "schema": {"type": "object", "properties": {"findings": {"type": "array", "items": {"type": "object", "properties": {"severity": {"type": "string", "enum": ["high", "medium", "low"]}, "where": {"type": "string"}, "defect": {"type": "string"}, "trigger": {"type": "string"}}, "required": ["severity", "where", "defect", "trigger"], "additionalProperties": false}}}, "required": ["findings"], "additionalProperties": false}}}'
 
+          # What counts as a review, asked in two places and so worth writing once: the array that was asked for, holding findings that carry the four fields that were asked for.
+          # `strict` in the schema is a request rather than a guarantee — a free model answered `[{"trigger": "..."}]` with everything else missing, which satisfies "is an array" and renders as a column of `null` posted at somebody.
+          shaped='type == "object" and (.findings | type) == "array" and ([.findings[] | select((.severity | type) == "string" and (.where | type) == "string" and (.defect | type) == "string" and (.trigger | type) == "string")] | length) == (.findings | length)'
+
           # A fixed cap rather than the model context window, since the free roster rotates and its limits rotate with it
           limit=120000
           if [ "$(wc -c < diff.patch)" -gt "$limit" ]; then
@@ -159,7 +163,7 @@ jobs:
               if [ -n "$review" ]; then
                 finish=$(jq -r '.choices[0].finish_reason // empty' response.json) || finish=''
 
-                if printf '%s' "$review" | jq -e 'has("findings") and (.findings | type) == "array"' > /dev/null 2>&1; then
+                if printf '%s' "$review" | jq -e "$shaped" > /dev/null 2>&1; then
                   break
                 fi
 
@@ -230,7 +234,7 @@ jobs:
             footer="\`$model\`. $disclaimer"
 
             # A schema is what was asked for, not what a free model is held to, so anything that will not parse is posted as the prose it came back as
-            if printf '%s' "$review" | jq -e 'has("findings") and (.findings | type) == "array"' > /dev/null 2>&1; then
+            if printf '%s' "$review" | jq -e "$shaped" > /dev/null 2>&1; then
               if [ "$(printf '%s' "$review" | jq '.findings | length')" -eq 0 ]; then
                 body='No findings.'
               else
