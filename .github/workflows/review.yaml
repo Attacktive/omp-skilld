@@ -56,12 +56,16 @@ jobs:
           instructions='You are reviewing a pull request for a TypeScript plugin that runs inside a coding agent.
           Report only defects you can point at: correctness bugs, unhandled errors, race conditions, resource leaks, and mistakes that differ between Linux, macOS and Windows.
           Do not summarise the diff, do not praise it, and do not comment on formatting or style.
-          At most three findings, worst first — three is what fits in the budget, and a fourth that arrives cut off in the middle of a word is worth less than nothing.
-          `where` is the file and the function or symbol in it; `trigger` is the input or state that makes the defect happen.
-          Be terse: one sentence per field. An empty array if nothing is wrong.'
+          Most diffs contain no defect at all, and an empty array is the ordinary answer. Report what you actually found and then stop: a finding invented to reach a count is worth less than the silence it replaced. At most three, worst first, and if you found more than three keep the worst three.
+          Read the diff as a change rather than as a file. A line starting with `-` has been removed and cannot be a defect. A comment describing what a change fixed is not evidence that it is still broken.
+          `severity` is high only for losing data, corrupting state, or breaking a platform the plugin supports. Most real findings are medium or low.
+          `where` is the file, and the function or symbol inside it. Never a line number: the diff does not carry the numbering you would need to get one right.
+          `trigger` is the input or state that makes the defect happen.
+          Be terse: one sentence per field.'
 
           # Asking for a schema is what keeps these models out of prose: the same diff that produced 266 lines of a model thinking aloud comes back as five findings and a sixth of the tokens.
           # No `line` field on purpose — it is the one these models invent, and it was garbage in the JSON besides.
+          # Leaving it out is not enough on its own: they answer `where` as `review.yaml#63-68` instead, which is the same invented number wearing the next field along, so the instructions have to say so.
           schema='{"type": "json_schema", "json_schema": {"name": "review", "strict": true, "schema": {"type": "object", "properties": {"findings": {"type": "array", "items": {"type": "object", "properties": {"severity": {"type": "string", "enum": ["high", "medium", "low"]}, "where": {"type": "string"}, "defect": {"type": "string"}, "trigger": {"type": "string"}}, "required": ["severity", "where", "defect", "trigger"], "additionalProperties": false}}}, "required": ["findings"], "additionalProperties": false}}}'
 
           # What counts as a review, asked in two places and so worth writing once: the array that was asked for, holding findings that carry the four fields that were asked for.
