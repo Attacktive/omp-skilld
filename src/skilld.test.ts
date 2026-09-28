@@ -7,7 +7,7 @@ import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import * as pluginModule from './skilld.ts';
 import plugin from './skilld.ts';
-import { ABANDONED_MS, DEFAULT_INTERVAL_MS, FAILURE_COOLDOWN_MS, NOT_EXECUTABLE, NOT_FOUND, PLUGIN_NAME, asInterval, asPlaceholder, asSources, complaint, dropPlaceholder, expand, installCommand, isEmpty, isRepo, isSource, isStale, layout, linkSkills, normalize, unlink, readPluginSettings, resolveStaging, settleParked, slugify, staging, swap, sweepGuard } from './internals.ts';
+import { ABANDONED_MS, DEFAULT_INTERVAL_MS, FAILURE_COOLDOWN_MS, NOT_EXECUTABLE, NOT_FOUND, PLUGIN_NAME, asInterval, asPlaceholder, asSources, complaint, dropPlaceholder, expand, installCommand, isEmpty, isRepo, isSource, isStale, layout, linkSkills, normalize, unlink, readPluginSettings, resolveStaging, selectSkills, settleParked, slugify, staging, swap, sweepGuard } from './internals.ts';
 
 const INTERVAL_MS = 24 * 60 * 60 * 1000;
 
@@ -446,42 +446,33 @@ test(
 );
 
 test(
-	'linkSkills publishes only included skills',
-	() => {
-		const { target, linkRoot } = downloaded('link-include', ['frontend-design', 'mcp-builder', 'pdf']);
-
-		expect(linkSkills(target, linkRoot, ['frontend-design', 'mcp-builder']).skills.sort())
-			.toEqual(['frontend-design', 'mcp-builder']);
-
-		expect(readdirSync(linkRoot).sort())
-			.toEqual(['frontend-design', 'mcp-builder']);
-	}
+	'selectSkills publishes only included skills',
+	() => expect(selectSkills(['frontend-design', 'mcp-builder', 'pdf'], { include: ['frontend-design', 'mcp-builder'] }))
+		.toEqual({ skills: ['frontend-design', 'mcp-builder'], missingIncludes: [] })
 );
 
 test(
-	'linkSkills publishes everything except excluded skills',
-	() => {
-		const { target, linkRoot } = downloaded('link-exclude-only', ['frontend-design', 'mcp-builder', 'pdf']);
-
-		expect(linkSkills(target, linkRoot, undefined, ['pdf']).skills.sort())
-			.toEqual(['frontend-design', 'mcp-builder']);
-
-		expect(readdirSync(linkRoot).sort())
-			.toEqual(['frontend-design', 'mcp-builder']);
-	}
+	'selectSkills publishes everything except excluded skills',
+	() => expect(selectSkills(['frontend-design', 'mcp-builder', 'pdf'], { exclude: ['pdf'] }))
+		.toEqual({ skills: ['frontend-design', 'mcp-builder'], missingIncludes: [] })
 );
 
 test(
-	'linkSkills excludes skills after inclusion, so exclusion always wins',
-	() => {
-		const { target, linkRoot } = downloaded('link-exclude', ['frontend-design', 'mcp-builder', 'pdf']);
+	'selectSkills excludes skills after inclusion, so exclusion always wins',
+	() => expect(selectSkills(['frontend-design', 'mcp-builder', 'pdf'], { include: ['frontend-design', 'mcp-builder'], exclude: ['mcp-builder'] }))
+		.toEqual({ skills: ['frontend-design'], missingIncludes: [] })
+);
 
-		expect(linkSkills(target, linkRoot, ['frontend-design', 'mcp-builder'], ['mcp-builder']).skills)
-			.toEqual(['frontend-design']);
+test(
+	'selectSkills treats an empty include as publish none',
+	() => expect(selectSkills(['frontend-design', 'mcp-builder'], { include: [] }))
+		.toEqual({ skills: [], missingIncludes: [] })
+);
 
-		expect(readdirSync(linkRoot))
-			.toEqual(['frontend-design']);
-	}
+test(
+	'selectSkills reports missing includes but lets stale excludes stay harmless',
+	() => expect(selectSkills(['frontend-design', 'pdf'], { include: ['frontend-desgin'], exclude: ['PDF'] }))
+		.toEqual({ skills: [], missingIncludes: ['frontend-desgin'] })
 );
 
 test(
@@ -494,8 +485,8 @@ test(
 		expect(readdirSync(linkRoot).sort())
 			.toEqual(['frontend-design', 'mcp-builder']);
 
-		expect(linkSkills(target, linkRoot, ['frontend-design']))
-			.toEqual({ skills: ['frontend-design'], linked: [], refused: [] });
+		expect(linkSkills(target, linkRoot, { include: ['frontend-design'] }))
+			.toEqual({ skills: ['frontend-design'], linked: [], refused: [], missingIncludes: [] });
 
 		expect(readdirSync(linkRoot))
 			.toEqual(['frontend-design']);
@@ -510,7 +501,7 @@ test(
 		linkSkills(target, linkRoot);
 
 		expect(linkSkills(target, linkRoot))
-			.toEqual({ skills: ['pdf'], linked: [], refused: [] });
+			.toEqual({ skills: ['pdf'], linked: [], refused: [], missingIncludes: [] });
 	}
 );
 
@@ -550,7 +541,7 @@ test(
 		rmSync(join(target, 'dropped'), { recursive: true, force: true });
 
 		expect(linkSkills(target, linkRoot))
-			.toEqual({ skills: ['pdf'], linked: [], refused: [] });
+			.toEqual({ skills: ['pdf'], linked: [], refused: [], missingIncludes: [] });
 
 		// The listing, rather than `existsSync`, because a link left dangling would read as absent while still sitting there.
 		expect(readdirSync(linkRoot).sort())
@@ -574,6 +565,71 @@ test(
 			label: 'anthropics/skills',
 			placeholder: 'template'
 		});
+	}
+);
+
+test(
+	'the plugin carries source selectors through publication',
+	async () => {
+		const target = join(scratch, 'selector-wiring', 'target');
+		const stamp = join(scratch, 'selector-wiring', 'stamp');
+		const linkRoot = join(scratch, 'agent', 'skills');
+
+		for (const skill of ['selector-keep', 'selector-exclude', 'selector-outside']) {
+			mkdirSync(join(target, skill), { recursive: true });
+			writeFileSync(join(target, skill, 'SKILL.md'), '');
+		}
+
+		writeFileSync(stamp, '');
+
+		const { run } = listener();
+		await run({
+			sources: [{
+				repo: 'someone/their-skills',
+				target,
+				stamp,
+				include: ['selector-keep', 'selector-exclude'],
+				exclude: ['selector-exclude']
+			}]
+		});
+
+		expect(existsSync(join(linkRoot, 'selector-keep')))
+			.toBe(true);
+
+		expect(existsSync(join(linkRoot, 'selector-exclude')))
+			.toBe(false);
+
+		expect(existsSync(join(linkRoot, 'selector-outside')))
+			.toBe(false);
+	}
+);
+
+test(
+	'the plugin reports a missing included skill instead of silently publishing nothing',
+	async () => {
+		const target = join(scratch, 'selector-missing', 'target');
+		const stamp = join(scratch, 'selector-missing', 'stamp');
+
+		mkdirSync(join(target, 'frontend-design'), { recursive: true });
+		writeFileSync(join(target, 'frontend-design', 'SKILL.md'), '');
+		writeFileSync(stamp, '');
+
+		const { heard, run } = listener();
+		await run({
+			sources: [{
+				repo: 'someone/their-skills',
+				target,
+				stamp,
+				include: ['frontend-desgin'],
+				exclude: ['retired-skill']
+			}]
+		});
+
+		expect(heard.some((toast) => toast.type === 'warning' && toast.message.includes('frontend-desgin')))
+			.toBe(true);
+
+		expect(heard.some((toast) => toast.message.includes('retired-skill')))
+			.toBe(false);
 	}
 );
 
@@ -686,7 +742,7 @@ test(
 
 		// The second launch has to recognise its own link, not refuse it as the user's.
 		expect(linkSkills(`${target}/`, linkRoot))
-			.toEqual({ skills: ['pdf'], linked: [], refused: [] });
+			.toEqual({ skills: ['pdf'], linked: [], refused: [], missingIncludes: [] });
 	}
 );
 
@@ -1664,6 +1720,7 @@ test(
 			{ sources: 42 },
 			{ sources: [{ target: '/nowhere' }] },
 			{ sources: [{ repo: 'someone/their-skills', target: 123 }] },
+			{ sources: [{ repo: 'someone/their-skills', include: 'pdf' }] },
 			{ sources: [], interval: 'daily' },
 			{ source: ['anthropics/skills'] },
 			// Text, but no `owner/repo` in it — refused here rather than handed to `gh` to fail on.
@@ -1678,15 +1735,18 @@ test(
 		}
 
 		expect(heard.map((toast) => toast.type))
-			.toEqual(['error', 'error', 'error', 'error', 'error', 'error', 'error']);
+			.toEqual(['error', 'error', 'error', 'error', 'error', 'error', 'error', 'error']);
 
 		expect(heard[0]?.message)
 			.toContain('list of repositories');
 
-		expect(heard[4]?.message)
-			.toContain('`source`');
+		expect(heard[3]?.message)
+			.toContain('`include`/`exclude` arrays');
 
 		expect(heard[5]?.message)
+			.toContain('`source`');
+
+		expect(heard[6]?.message)
 			.toContain('malformed source');
 	}
 );

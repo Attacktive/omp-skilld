@@ -52,15 +52,18 @@ const PLACEHOLDER_DESCRIPTION = /Replace with description of the skill/i;
 /** The package name, which is also the key under which omp stores this plugin's settings. */
 const PLUGIN_NAME = 'omp-skilld';
 
-interface SkillRepository {
+interface SkillSelection {
+	include?: string[];
+	exclude?: string[];
+}
+
+interface SkillRepository extends SkillSelection {
 	/** A GitHub `"owner/repo"` to pull skills from, e.g. `"anthropics/skills"`. */
 	repo: string;
 	target?: string;
 	stamp?: string;
 	label?: string;
 	placeholder?: string | false;
-	include?: string[];
-	exclude?: string[];
 }
 
 type SkillSource = string | SkillRepository;
@@ -71,14 +74,12 @@ interface Options {
 	interval?: number;
 }
 
-interface NormalizedSource {
+interface NormalizedSource extends SkillSelection {
 	repo: string;
 	target: string;
 	stamp: string;
 	label: string;
 	placeholder: string | false;
-	include?: string[];
-	exclude?: string[];
 }
 
 const slugify = (repo: string) => repo.replace(/\//g, '-');
@@ -105,6 +106,12 @@ const expand = (path: string) => {
 	return path;
 };
 
+/** A non-empty string, which is the only text an option may hold: `''` survives `expand` untouched and would reach `mkdirSync` as an unrefreshable path. */
+const isText = (value: unknown): value is string => typeof value === 'string' && value.length > 0;
+
+/** A single directory name rather than a path or dot-segment. */
+const isDirectoryName = (value: unknown): value is string => isText(value) && value !== '.' && value !== '..' && !value.includes('/') && !value.includes('\\');
+
 /**
  * Refuses anything that is not a single directory name.
  * The placeholder is deleted with a recursive, forced `rmSync`, so an empty string would aim that at `target` itself and a path would aim it somewhere else entirely.
@@ -114,25 +121,17 @@ const asPlaceholder = (placeholder: unknown): string | false => {
 		return DEFAULT_PLACEHOLDER;
 	}
 
-	if (typeof placeholder !== 'string') {
-		return false;
-	}
-
-	if (placeholder.length === 0 || placeholder === '.' || placeholder === '..' || placeholder.includes('/') || placeholder.includes('\\')) {
+	if (!isDirectoryName(placeholder)) {
 		return false;
 	}
 
 	return placeholder;
 };
 
-/** A non-empty string, which is the only text an option may hold: `''` survives `expand` untouched and would reach `mkdirSync` as an unrefreshable path. */
-const isText = (value: unknown): value is string => typeof value === 'string' && value.length > 0;
-
 const isOptionalText = (value: unknown) => value === undefined || isText(value);
 
-const isSkillName = (value: unknown): value is string => isText(value) && value !== '.' && value !== '..' && !value.includes('/') && !value.includes('\\');
-
-const isOptionalSkillList = (value: unknown) => value === undefined || (Array.isArray(value) && value.every(isSkillName));
+/** Selector names are matched directly against directory names from `readdirSync`, so paths and dot-segments can never match and are rejected at the configuration boundary. */
+const isOptionalSkillList = (value: unknown) => value === undefined || (Array.isArray(value) && value.every(isDirectoryName));
 
 const asInterval = (interval: unknown): number | undefined => {
 	if (interval === undefined) {
@@ -258,23 +257,15 @@ const normalize = (source: SkillSource, root: string): NormalizedSource => {
 	const target = resolve(expand(configured.target ?? join(root, slug)));
 	const stamp = resolve(expand(configured.stamp ?? join(root, `.${slug}-refreshed`)));
 
-	const normalized: NormalizedSource = {
+	return {
 		repo: configured.repo,
 		target,
 		stamp,
 		label: configured.label ?? configured.repo,
-		placeholder: asPlaceholder(configured.placeholder)
+		placeholder: asPlaceholder(configured.placeholder),
+		include: configured.include,
+		exclude: configured.exclude
 	};
-
-	if (configured.include !== undefined) {
-		normalized.include = configured.include;
-	}
-
-	if (configured.exclude !== undefined) {
-		normalized.exclude = configured.exclude;
-	}
-
-	return normalized;
 };
 
 /** A stamp that cannot be read counts as stale: there has never been a successful refresh to go by. */
@@ -529,26 +520,38 @@ const installedSkills = (target: string) => readdirSync(target, { withFileTypes:
 	.map((entry) => entry.name);
 
 /**
+ * Applies exact-name source selection.
+ * `include` chooses the candidate set, `exclude` always wins, missing include names are surfaced because a typo can silently publish nothing, and stale exclude names are deliberately harmless.
+ */
+const selectSkills = (available: string[], selection: SkillSelection = {}) => {
+	const availableNames = new Set(available);
+	const included = new Set(selection.include ?? available);
+	const excluded = new Set(selection.exclude ?? []);
+	const missingIncludes: string[] = [];
+
+	if (selection.include !== undefined) {
+		for (const name of selection.include) {
+			if (!availableNames.has(name)) {
+				missingIncludes.push(name);
+			}
+		}
+	}
+
+	const skills = available
+		.filter((name) => included.has(name) && !excluded.has(name));
+
+	return { skills, missingIncludes };
+};
+
+/**
  * Publishes a finished download into the skills directory omp scans on its own, so a refresh is seen without anything having to be configured.
  * One symlink per skill rather than a copy, which omp's scan takes as readily as a directory — and which doubles as the record of what belongs to this plugin: a link into the target is this plugin's to remove, and everything else is left exactly where it is.
  * The links survive a refresh untouched, since what they point at is a path inside `target` and a swap only changes what that path holds.
  */
-const linkSkills = (target: string, linkRoot: string, include?: string[], exclude?: string[]) => {
+const linkSkills = (target: string, linkRoot: string, selection: SkillSelection = {}) => {
 	mkdirSync(linkRoot, { recursive: true });
 
-	const available = installedSkills(target);
-	let skills = available;
-	if (include !== undefined) {
-		const included = new Set(include);
-
-		skills = available.filter((name) => included.has(name));
-	}
-
-	if (exclude !== undefined) {
-		const excluded = new Set(exclude);
-
-		skills = skills.filter((name) => !excluded.has(name));
-	}
+	const { skills, missingIncludes } = selectSkills(installedSkills(target), selection);
 
 	sweepLinks(target, linkRoot, new Set(skills));
 
@@ -561,7 +564,6 @@ const linkSkills = (target: string, linkRoot: string, include?: string[], exclud
 		kind = 'dir';
 	}
 
-	/** Every selected skill, linked or not, so a caller can say how many of them omp is about to see. */
 	const linked: string[] = [];
 	const refused: string[] = [];
 
@@ -583,7 +585,7 @@ const linkSkills = (target: string, linkRoot: string, include?: string[], exclud
 		linked.push(name);
 	}
 
-	return { skills, linked, refused };
+	return { skills, linked, refused, missingIncludes };
 };
 
 /**
@@ -735,4 +737,4 @@ const readPluginSettings = async (cwd: string): Promise<{ options: Record<string
 	}
 };
 
-export { DEFAULT_INTERVAL_MS, ANNOUNCEMENT_DELAY_MS, DEFAULT_PLACEHOLDER, ABANDONED_MS, FAILURE_COOLDOWN_MS, NOT_FOUND, NOT_EXECUTABLE, PLUGIN_NAME, type SkillRepository, type SkillSource, type Options, type NormalizedSource, type StagingState, type Layout, slugify, reason, complaint, expand, asInterval, asPlaceholder, asSources, isRepo, isSource, layout, normalize, staging, installCommand, settleParked, swap, isStale, isEmpty, dropPlaceholder, linkSkills, unlink, resolveStaging, readPluginSettings };
+export { DEFAULT_INTERVAL_MS, ANNOUNCEMENT_DELAY_MS, DEFAULT_PLACEHOLDER, ABANDONED_MS, FAILURE_COOLDOWN_MS, NOT_FOUND, NOT_EXECUTABLE, PLUGIN_NAME, type SkillRepository, type SkillSource, type Options, type NormalizedSource, type StagingState, type Layout, slugify, reason, complaint, expand, asInterval, asPlaceholder, asSources, isRepo, isSource, layout, normalize, staging, installCommand, settleParked, swap, isStale, isEmpty, dropPlaceholder, selectSkills, linkSkills, unlink, resolveStaging, readPluginSettings };

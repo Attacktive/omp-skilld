@@ -180,10 +180,17 @@ const download = (repo: string, incoming: string, done: string, failed: string, 
  */
 const publish = (source: NormalizedSource, linkRoot: string, voice: Voice, log: Log) => {
 	try {
-		const { skills, linked, refused } = linkSkills(source.target, linkRoot, source.include, source.exclude);
+		const { skills, linked, refused, missingIncludes } = linkSkills(source.target, linkRoot, source);
 
 		if (linked.length > 0) {
 			log(`${source.label}: linked ${linked.length} skill(s) into ${linkRoot}`);
+		}
+
+		if (missingIncludes.length > 0) {
+			const names = missingIncludes.join(', ');
+
+			log(`${source.label}: included skill names not found in the download: ${names}`);
+			voice.toast(`Included skills were not found in ${source.label}: ${names}.`, 'warning');
 		}
 
 		if (refused.length > 0) {
@@ -191,7 +198,7 @@ const publish = (source: NormalizedSource, linkRoot: string, voice: Voice, log: 
 			log(`${source.label}: not linked, since you have skills of those names already: ${refused.join(', ')}`);
 		}
 
-		// What omp will see of this source, which is every skill in it bar the names that were already somebody else's.
+		// What omp will see of this source, which is every selected skill bar the names that were already somebody else's.
 		return skills.length - refused.length;
 	} catch (cause) {
 		log(`${source.label}: could not link into ${linkRoot}: ${reason(cause)}`);
@@ -552,7 +559,7 @@ const sweep = async (agentDir: string, cwd: string, voice: Voice, log: Log, ctx:
 	for (const configured of sources) {
 		if (!isSource(configured)) {
 			log(`ignoring a malformed source: ${JSON.stringify(configured)}`);
-			voice.toast(`Ignoring a malformed source: ${JSON.stringify(configured)}. A source is an \`owner/repo\`, or an object naming one.`, 'error');
+			voice.toast(`Ignoring a malformed source: ${JSON.stringify(configured)}. A source is an \`owner/repo\`, or an object with \`repo\`, optional \`target\`/\`stamp\`/\`label\` strings, \`placeholder\` as a directory name or false, and \`include\`/\`exclude\` arrays of exact skill names.`, 'error');
 			continue;
 		}
 

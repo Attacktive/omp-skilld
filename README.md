@@ -75,7 +75,7 @@ A project can override any of it for itself in `.omp/plugin-overrides.json`, whi
 }
 ```
 
-That is the whole setup: OMP scans `~/.omp/agent/skills` on its own, and the plugin publishes each downloaded skill there as a symlink into `~/.omp/skilld/<slug>`, one link per skill.
+That is the whole setup: OMP scans `~/.omp/agent/skills` on its own, and the plugin publishes each selected skill from a download there as a symlink into `~/.omp/skilld/<slug>`, one link per selected skill; `include` and `exclude` below control that selection.
 Nothing has to be added to `config.yml`, and the links survive a refresh untouched — they point at a path inside the download, and a refresh only changes what that path holds.
 
 A name you already hold there wins: a real directory of your own is never replaced, and the download keeps refreshing on disk in case you free the name later.
@@ -110,8 +110,8 @@ A source given as an object can override what the bare `owner/repo` derives:
 | `stamp`       | `~/.omp/skilld/.<slug>-refreshed`      | Where the last successful refresh is recorded.                                                          |
 | `label`       | `repo`                                 | The name used in toasts.                                                                                |
 | `placeholder` | `"template"`                           | The placeholder skill directory to drop from each download, or `false` to keep whatever upstream ships. |
-| `include`     | all skills                             | Exact skill names to publish. An empty list publishes none.                                               |
-| `exclude`     | `[]`                                   | Exact skill names not to publish. Applied after `include`, so exclusion wins when both name a skill.     |
+| `include`     | all skills                             | Exact skill names to publish. An empty list publishes none.                                             |
+| `exclude`     | `[]`                                   | Exact skill names not to publish. Applied after `include`, so exclusion wins when both name a skill.    |
 
 The wholesale replacement a refresh performs is why `target` must not share a directory with anything else.
 Pointing it at a directory OMP scans — `~/.omp/agent/skills`, say — looks like it would save a symlink, but the next refresh would stand one repository's download in for the *entire* directory: another source's skills, the ones you wrote by hand, all gone with it.
@@ -119,6 +119,8 @@ Give every source a directory of its own, and let publication be what puts skill
 
 `include` chooses the candidate skills and `exclude` removes from that set.
 With neither configured, every downloaded skill is published; with both configured, a name in `exclude` always wins.
+Names are exact and case-sensitive.
+A missing `include` name is reported because a typo can silently publish nothing, while a missing `exclude` name is ignored so stale blacklist entries stay harmless.
 Selection only controls publication: skilld still downloads the repository once with `gh skill install --all`, so changing a selector takes effect on the next launch without another download.
 
 Nothing above is enforced by the settings schema, so everything is validated at runtime.
