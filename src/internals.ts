@@ -130,6 +130,10 @@ const asPlaceholder = (placeholder: unknown): string | false => {
 
 const isOptionalText = (value: unknown) => value === undefined || isText(value);
 
+const isObject = (value: unknown): value is object => typeof value === 'object' && value !== null;
+
+const isOptionalPlaceholder = (value: unknown) => value === undefined || typeof value === 'string' || value === false;
+
 /** Selector names are matched directly against directory names from `readdirSync`, so paths and dot-segments can never match and are rejected at the configuration boundary. */
 const isOptionalSkillList = (value: unknown) => value === undefined || (Array.isArray(value) && value.every(isDirectoryName));
 
@@ -206,7 +210,7 @@ const isSource = (source: unknown): source is SkillSource => {
 		return isRepo(source);
 	}
 
-	if (typeof source !== 'object' || source === null) {
+	if (!isObject(source)) {
 		return false;
 	}
 
@@ -224,7 +228,7 @@ const isSource = (source: unknown): source is SkillSource => {
 		return false;
 	}
 
-	return placeholder === undefined || typeof placeholder === 'string' || placeholder === false;
+	return isOptionalPlaceholder(placeholder);
 };
 
 /** The two directories a launch works in: where this plugin assembles downloads, and the skills directory omp scans without being asked to. */
@@ -547,6 +551,7 @@ const selectSkills = (available: string[], selection: SkillSelection = {}) => {
  * Publishes a finished download into the skills directory omp scans on its own, so a refresh is seen without anything having to be configured.
  * One symlink per skill rather than a copy, which omp's scan takes as readily as a directory — and which doubles as the record of what belongs to this plugin: a link into the target is this plugin's to remove, and everything else is left exactly where it is.
  * The links survive a refresh untouched, since what they point at is a path inside `target` and a swap only changes what that path holds.
+ * Selected `skills` are returned separately from newly `linked` names because `publish` counts what OMP will actually see for its settled pin, including links that were already correct.
  */
 const linkSkills = (target: string, linkRoot: string, selection: SkillSelection = {}) => {
 	mkdirSync(linkRoot, { recursive: true });
