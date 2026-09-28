@@ -59,6 +59,7 @@ omp plugin config list omp-skilld
 ```bash
 omp plugin config set omp-skilld sources 'anthropics/skills, someone/their-skills'
 omp plugin config set omp-skilld sources '[{"repo": "anthropics/skills", "target": "~/skills/anthropic"}]'
+omp plugin config set omp-skilld sources '[{"repo": "anthropics/skills", "include": ["frontend-design", "mcp-builder"]}, "obra/superpowers"]'
 omp plugin config set omp-skilld interval 604800000
 ```
 
@@ -109,13 +110,19 @@ A source given as an object can override what the bare `owner/repo` derives:
 | `stamp`       | `~/.omp/skilld/.<slug>-refreshed`      | Where the last successful refresh is recorded.                                                          |
 | `label`       | `repo`                                 | The name used in toasts.                                                                                |
 | `placeholder` | `"template"`                           | The placeholder skill directory to drop from each download, or `false` to keep whatever upstream ships. |
+| `include`     | all skills                             | Exact skill names to publish. An empty list publishes none.                                               |
+| `exclude`     | `[]`                                   | Exact skill names not to publish. Applied after `include`, so exclusion wins when both name a skill.     |
 
 The wholesale replacement a refresh performs is why `target` must not share a directory with anything else.
 Pointing it at a directory OMP scans — `~/.omp/agent/skills`, say — looks like it would save a symlink, but the next refresh would stand one repository's download in for the *entire* directory: another source's skills, the ones you wrote by hand, all gone with it.
 Give every source a directory of its own, and let publication be what puts skills where OMP looks.
 
+`include` chooses the candidate skills and `exclude` removes from that set.
+With neither configured, every downloaded skill is published; with both configured, a name in `exclude` always wins.
+Selection only controls publication: skilld still downloads the repository once with `gh skill install --all`, so changing a selector takes effect on the next launch without another download.
+
 Nothing above is enforced by the settings schema, so everything is validated at runtime.
-Anything that does not match is ignored with an error toast rather than taken literally — an option with an unknown name, a `sources` that is neither a list nor JSON describing one, an entry that names no `repo` or names something that is not `owner/repo`, an entry giving `target`, `stamp` or `label` the wrong type or an empty string, an `interval` that is not a number.
+Anything that does not match is ignored with an error toast rather than taken literally — an option with an unknown name, a `sources` that is neither a list nor JSON describing one, an entry that names no `repo` or names something that is not `owner/repo`, an entry giving `target`, `stamp` or `label` the wrong type or an empty string, an `include` or `exclude` that is not an array of exact skill names, an `interval` that is not a number.
 
 A `~` on its own, or a leading `~/`, is expanded in `target` and `stamp`.
 Nothing else is — not `$VAR`, not `~user` — because these go straight to `mkdirSync` and never near a shell.
@@ -145,7 +152,7 @@ That searches skills, though, and `sources` takes repositories. Topic search fin
 gh api "search/repositories?q=topic:agent-skills&sort=stars&per_page=20" --jq '.items[] | "★\(.stargazers_count)\t\(.full_name)"'
 ```
 
-Then check the layout before adding one, because `--all` means a source is a repository you want *whole*, every launch:
+Then check the layout before adding one, because skilld still downloads each source with `--all` even when `include` or `exclude` narrows what gets published:
 
 ```bash
 gh api repos/<owner>/<repo>/contents/skills --jq '.[] | .type + " " + .name'
@@ -161,7 +168,7 @@ A flat list of directories, and not too many. A repository that files skills by 
 - Never awaited, and the download is detached, so quitting OMP never waits on one — and never kills one either. A download that outlives its launch records how it ended beside the staging directory; the next launch installs a finished one instead of downloading it again. Two launches that find the same finished download cannot both install it: claiming it is a single unlink, and the one that loses it stands aside.
 - A download still running is left alone, however short the interval. Each download records its process id beside its staging directory, so a launch asks the process itself: alive means left alone however quiet the directory, gone means swept at once — a reboot mid-download, say. Only a download with no pid to ask falls back to the clock: one whose staging area has seen no new file anywhere in fifteen minutes is taken for dead and swept, so the next attempt starts clean.
 - A failed download is left alone for an hour before another is attempted, which is what keeps a rate limit or an expired login from costing an attempt per launch. Its staging directory is kept as the record of that failure, and swept when the hour is up. A `gh` that was never found, or could not be run, is exempt: none of the rate limit was spent, so installing it and relaunching refreshes at once instead of an hour later.
-- Publishes into `~/.omp/agent/skills` as one symlink per skill, on every launch rather than only after a download, so a link deleted by hand or a name freed since the last refresh is repaired at once. A link into the download root is the plugin's to remove; anything else there is yours and is never touched, which is also how a skill dropped upstream gets its name freed again.
+- Publishes the skills selected by each source's `include` and `exclude` into `~/.omp/agent/skills` as one symlink per skill, on every launch rather than only after a download, so changing a selector, deleting a link by hand, or freeing a name takes effect at once. A link into the download root is the plugin's to remove; anything else there is yours and is never touched, which is also how a skill dropped upstream gets its name freed again.
 - A name already taken by a directory of your own is left alone rather than replaced, and reported to the log. The download still refreshes, so freeing the name is all it takes to get it.
 - Nothing throws. A missing `gh`, an expired login, a plane — all of them degrade to an error toast, never a broken launch.
 - A failed download quotes `gh` rather than only its exit code. The stream `gh` explains itself on is kept beside the staging directory, and the end of what it said — a repository that is not there, a login that expired, two skills that would overwrite each other — goes into the toast, the pin and the log alongside the code. The end rather than the start, because a download prints its progress on that same stream and the reason it stopped comes last; trimmed to a line, and cut at the front when it still does not fit, because `gh` prints its hint before the reason it is hinting about. A `gh` that failed without a word leaves the exit code to speak alone.

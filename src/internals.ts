@@ -59,6 +59,8 @@ interface SkillRepository {
 	stamp?: string;
 	label?: string;
 	placeholder?: string | false;
+	include?: string[];
+	exclude?: string[];
 }
 
 type SkillSource = string | SkillRepository;
@@ -75,6 +77,8 @@ interface NormalizedSource {
 	stamp: string;
 	label: string;
 	placeholder: string | false;
+	include?: string[];
+	exclude?: string[];
 }
 
 const slugify = (repo: string) => repo.replace(/\//g, '-');
@@ -125,6 +129,10 @@ const asPlaceholder = (placeholder: unknown): string | false => {
 const isText = (value: unknown): value is string => typeof value === 'string' && value.length > 0;
 
 const isOptionalText = (value: unknown) => value === undefined || isText(value);
+
+const isSkillName = (value: unknown): value is string => isText(value) && value !== '.' && value !== '..' && !value.includes('/') && !value.includes('\\');
+
+const isOptionalSkillList = (value: unknown) => value === undefined || (Array.isArray(value) && value.every(isSkillName));
 
 const asInterval = (interval: unknown): number | undefined => {
 	if (interval === undefined) {
@@ -203,13 +211,17 @@ const isSource = (source: unknown): source is SkillSource => {
 		return false;
 	}
 
-	const { repo, target, stamp, label, placeholder } = source as { [K in keyof SkillRepository]: unknown };
+	const { repo, target, stamp, label, placeholder, include, exclude } = source as { [K in keyof SkillRepository]: unknown };
 
 	if (!isRepo(repo)) {
 		return false;
 	}
 
 	if (![target, stamp, label].every(isOptionalText)) {
+		return false;
+	}
+
+	if (![include, exclude].every(isOptionalSkillList)) {
 		return false;
 	}
 
@@ -246,13 +258,23 @@ const normalize = (source: SkillSource, root: string): NormalizedSource => {
 	const target = resolve(expand(configured.target ?? join(root, slug)));
 	const stamp = resolve(expand(configured.stamp ?? join(root, `.${slug}-refreshed`)));
 
-	return {
+	const normalized: NormalizedSource = {
 		repo: configured.repo,
 		target,
 		stamp,
 		label: configured.label ?? configured.repo,
 		placeholder: asPlaceholder(configured.placeholder)
 	};
+
+	if (configured.include !== undefined) {
+		normalized.include = configured.include;
+	}
+
+	if (configured.exclude !== undefined) {
+		normalized.exclude = configured.exclude;
+	}
+
+	return normalized;
 };
 
 /** A stamp that cannot be read counts as stale: there has never been a successful refresh to go by. */
@@ -490,12 +512,12 @@ const unlink = (link: string) => {
 	}
 };
 
-/** Links this plugin wrote for skills that are no longer in the download: the name has to be free again before anything else can claim it. */
-const sweepLinks = (target: string, linkRoot: string) => {
+/** Links this plugin wrote for skills that are no longer selected: the name has to be free again before anything else can claim it. */
+const sweepLinks = (target: string, linkRoot: string, selected: ReadonlySet<string>) => {
 	for (const name of readdirSync(linkRoot)) {
 		const link = join(linkRoot, name);
 
-		if (claim(link, target) === 'ours' && !existsSync(link)) {
+		if (claim(link, target) === 'ours' && !selected.has(name)) {
 			unlink(link);
 		}
 	}
@@ -511,9 +533,24 @@ const installedSkills = (target: string) => readdirSync(target, { withFileTypes:
  * One symlink per skill rather than a copy, which omp's scan takes as readily as a directory — and which doubles as the record of what belongs to this plugin: a link into the target is this plugin's to remove, and everything else is left exactly where it is.
  * The links survive a refresh untouched, since what they point at is a path inside `target` and a swap only changes what that path holds.
  */
-const linkSkills = (target: string, linkRoot: string) => {
+const linkSkills = (target: string, linkRoot: string, include?: string[], exclude?: string[]) => {
 	mkdirSync(linkRoot, { recursive: true });
-	sweepLinks(target, linkRoot);
+
+	const available = installedSkills(target);
+	let skills = available;
+	if (include !== undefined) {
+		const included = new Set(include);
+
+		skills = available.filter((name) => included.has(name));
+	}
+
+	if (exclude !== undefined) {
+		const excluded = new Set(exclude);
+
+		skills = skills.filter((name) => !excluded.has(name));
+	}
+
+	sweepLinks(target, linkRoot, new Set(skills));
 
 	// A junction is what Windows gives for a directory without asking for privileges.
 	let kind: 'junction' | 'dir';
@@ -524,9 +561,7 @@ const linkSkills = (target: string, linkRoot: string) => {
 		kind = 'dir';
 	}
 
-	/** Every skill in the download, linked or not, so a caller can say how many of them omp is about to see. */
-	const skills = installedSkills(target);
-
+	/** Every selected skill, linked or not, so a caller can say how many of them omp is about to see. */
 	const linked: string[] = [];
 	const refused: string[] = [];
 

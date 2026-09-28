@@ -34,7 +34,7 @@
 			"sources": {
 				"type": "string",
 				"default": "",
-				"description": "GitHub repositories to refresh skills from, as a list such as \"anthropics/skills, someone/their-skills\", or JSON for per-source overrides (repo/target/stamp/label/placeholder)"
+				"description": "GitHub repositories to refresh skills from, as a list such as \"anthropics/skills, someone/their-skills\", or JSON for per-source overrides (repo/target/stamp/label/placeholder/include/exclude)"
 			},
 			"interval": {
 				"type": "number",

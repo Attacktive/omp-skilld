@@ -180,7 +180,7 @@ const download = (repo: string, incoming: string, done: string, failed: string, 
  */
 const publish = (source: NormalizedSource, linkRoot: string, voice: Voice, log: Log) => {
 	try {
-		const { skills, linked, refused } = linkSkills(source.target, linkRoot);
+		const { skills, linked, refused } = linkSkills(source.target, linkRoot, source.include, source.exclude);
 
 		if (linked.length > 0) {
 			log(`${source.label}: linked ${linked.length} skill(s) into ${linkRoot}`);

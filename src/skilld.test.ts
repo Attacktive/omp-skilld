@@ -341,7 +341,10 @@ test(
 		expect(isSource({ repo: 'anthropics/skills' }))
 			.toBe(true);
 
-		expect(isSource({ repo: 'anthropics/skills', target: '~/skills', stamp: '~/stamp', label: 'the skills', placeholder: false }))
+		expect(isSource({ repo: 'anthropics/skills', target: '~/skills', stamp: '~/stamp', label: 'the skills', placeholder: false, include: ['frontend-design'], exclude: ['pdf'] }))
+			.toBe(true);
+
+		expect(isSource({ repo: 'anthropics/skills', include: [], exclude: [] }))
 			.toBe(true);
 	}
 );
@@ -383,6 +386,18 @@ test(
 			.toBe(false);
 
 		expect(isSource({ repo: 'anthropics/skills', stamp: '' }))
+			.toBe(false);
+
+		expect(isSource({ repo: 'anthropics/skills', include: 'pdf' }))
+			.toBe(false);
+
+		expect(isSource({ repo: 'anthropics/skills', exclude: [42] }))
+			.toBe(false);
+
+		expect(isSource({ repo: 'anthropics/skills', include: [''] }))
+			.toBe(false);
+
+		expect(isSource({ repo: 'anthropics/skills', exclude: ['nested/pdf'] }))
 			.toBe(false);
 	}
 );
@@ -427,6 +442,63 @@ test(
 
 		expect(existsSync(join(linkRoot, 'not-a-skill')))
 			.toBe(false);
+	}
+);
+
+test(
+	'linkSkills publishes only included skills',
+	() => {
+		const { target, linkRoot } = downloaded('link-include', ['frontend-design', 'mcp-builder', 'pdf']);
+
+		expect(linkSkills(target, linkRoot, ['frontend-design', 'mcp-builder']).skills.sort())
+			.toEqual(['frontend-design', 'mcp-builder']);
+
+		expect(readdirSync(linkRoot).sort())
+			.toEqual(['frontend-design', 'mcp-builder']);
+	}
+);
+
+test(
+	'linkSkills publishes everything except excluded skills',
+	() => {
+		const { target, linkRoot } = downloaded('link-exclude-only', ['frontend-design', 'mcp-builder', 'pdf']);
+
+		expect(linkSkills(target, linkRoot, undefined, ['pdf']).skills.sort())
+			.toEqual(['frontend-design', 'mcp-builder']);
+
+		expect(readdirSync(linkRoot).sort())
+			.toEqual(['frontend-design', 'mcp-builder']);
+	}
+);
+
+test(
+	'linkSkills excludes skills after inclusion, so exclusion always wins',
+	() => {
+		const { target, linkRoot } = downloaded('link-exclude', ['frontend-design', 'mcp-builder', 'pdf']);
+
+		expect(linkSkills(target, linkRoot, ['frontend-design', 'mcp-builder'], ['mcp-builder']).skills)
+			.toEqual(['frontend-design']);
+
+		expect(readdirSync(linkRoot))
+			.toEqual(['frontend-design']);
+	}
+);
+
+test(
+	'linkSkills sweeps a link that a changed selector no longer publishes',
+	() => {
+		const { target, linkRoot } = downloaded('link-filter-changed', ['frontend-design', 'mcp-builder']);
+
+		linkSkills(target, linkRoot);
+
+		expect(readdirSync(linkRoot).sort())
+			.toEqual(['frontend-design', 'mcp-builder']);
+
+		expect(linkSkills(target, linkRoot, ['frontend-design']))
+			.toEqual({ skills: ['frontend-design'], linked: [], refused: [] });
+
+		expect(readdirSync(linkRoot))
+			.toEqual(['frontend-design']);
 	}
 );
 
@@ -556,7 +628,9 @@ test(
 			target: '/skills',
 			stamp: '/state/stamp',
 			label: 'their skills',
-			placeholder: 'example'
+			placeholder: 'example',
+			include: ['frontend-design', 'mcp-builder'],
+			exclude: ['pdf']
 		};
 
 		expect(normalize(overridden, '/omp/skilld'))
