@@ -45,6 +45,28 @@ interface Voice {
 /** What a pin calls this plugin: `omp-skilld` is the package, and a status bar has no columns to spare for the prefix. */
 const BANNER = 'skilld';
 
+/** Subcommands shown by omp's argument picker, with the same right-hand descriptions its built-in commands use. */
+const COMMAND_COMPLETIONS = [
+	{ value: 'status', label: 'status', description: 'Show configured skill source status' },
+	{ value: 'refresh', label: 'refresh', description: 'Refresh one or all configured skill sources' }
+];
+
+const commandCompletions = (argumentPrefix: string) => {
+	const prefix = argumentPrefix.trimStart();
+	if (prefix.includes(' ')) {
+		return null;
+	}
+
+	const completions = COMMAND_COMPLETIONS
+		.filter(({ value }) => value.startsWith(prefix));
+
+	if (completions.length === 0) {
+		return null;
+	}
+
+	return completions;
+};
+
 /** The three colours a pin comes in, each one omp's own — a pin is painted by whatever theme is loaded rather than in colours of its own choosing. */
 type Colour = 'accent' | 'success' | 'error';
 
@@ -946,6 +968,7 @@ const plugin = (pi: ExtensionAPI): void => {
 		'skilld',
 		{
 			description: 'Show skill source status or refresh sources',
+			getArgumentCompletions: commandCompletions,
 			handler: async (args, ctx) => {
 				const command = args.trim();
 				const voice = voiceFor(ctx);
