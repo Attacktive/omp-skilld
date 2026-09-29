@@ -47,12 +47,12 @@ const BANNER = 'skilld';
 
 /** Subcommands shown by omp's argument picker, with the same right-hand descriptions its built-in commands use. */
 const COMMAND_COMPLETIONS = [
-	{ value: 'status', label: 'status', description: 'Show configured skill source status' },
-	{ value: 'refresh', label: 'refresh', description: 'Refresh one or all configured skill sources' }
+	{ value: 'status ', label: 'status', description: 'Show configured skill source status' },
+	{ value: 'refresh ', label: 'refresh', description: 'Refresh one or all configured skill sources' }
 ];
 
 const commandCompletions = (argumentPrefix: string) => {
-	const prefix = argumentPrefix.trimStart();
+	const prefix = argumentPrefix.trimStart().toLowerCase();
 	if (prefix.includes(' ')) {
 		return null;
 	}
