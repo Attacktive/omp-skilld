@@ -432,6 +432,27 @@ const prepareRefresh = (source: NormalizedSource, dirs: Layout, staleAfter: numb
 	return true;
 };
 
+/** Normalizes and claims one source, releasing the claim immediately when staging or freshness says there is no download to start. */
+const prepareConfiguredRefresh = (configured: SkillSource, dirs: Layout, staleAfter: number, voice: Voice, log: Log, force: boolean) => {
+	const source = normalize(configured, dirs.root);
+
+	if (!claimRefreshTarget(source, log)) {
+		return undefined;
+	}
+
+	try {
+		if (!prepareRefresh(source, dirs, staleAfter, voice, log, force)) {
+			refreshingTargets.delete(source.target);
+			return undefined;
+		}
+	} catch (cause) {
+		refreshingTargets.delete(source.target);
+		throw cause;
+	}
+
+	return source;
+};
+
 /** Fires one source's refresh off in the background and never waits on it. */
 const refresh = (configured: SkillSource, dirs: Layout, staleAfter: number, voice: Voice, log: Log, ctx: ExtensionContext, force = false) => {
 	// The catch at the bottom needs a name for the source no matter how little of the body ran.
@@ -442,19 +463,14 @@ const refresh = (configured: SkillSource, dirs: Layout, staleAfter: number, voic
 	let childOwnsClaim = false;
 
 	try {
-		const source = normalize(configured, dirs.root);
+		const source = prepareConfiguredRefresh(configured, dirs, staleAfter, voice, log, force);
+		if (source === undefined) {
+			return;
+		}
+
 		label = source.label;
 		voiceId = source.target;
-
-		if (!claimRefreshTarget(source, log)) {
-			return;
-		}
-
 		claimedTarget = source.target;
-
-		if (!prepareRefresh(source, dirs, staleAfter, voice, log, force)) {
-			return;
-		}
 
 		const { repo, target } = source;
 		const { incoming, done, failed, pid, noise } = staging(target);
@@ -692,6 +708,15 @@ const publishedSkillCount = (source: NormalizedSource, dirs: Layout) => {
 	}
 };
 
+const failedSourceStatus = (noise: string) => {
+	const detail = complaint(noise);
+	if (detail === undefined) {
+		return 'last refresh failed';
+	}
+
+	return `last refresh failed · ${detail}`;
+};
+
 const sourceStatus = (source: NormalizedSource, staleAfter: number) => {
 	const { incoming, done, failed, pid, noise } = staging(source.target);
 
@@ -704,12 +729,7 @@ const sourceStatus = (source: NormalizedSource, staleAfter: number) => {
 	}
 
 	if (existsSync(failed)) {
-		const detail = complaint(noise);
-		if (detail !== undefined) {
-			return `last refresh failed · ${detail}`;
-		}
-
-		return 'last refresh failed';
+		return failedSourceStatus(noise);
 	}
 
 	if (existsSync(incoming)) {
