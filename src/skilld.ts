@@ -34,8 +34,8 @@ interface Voice {
 	working: (label: string, detail: string) => void;
 	/** Replaces a source's pin with how the refresh turned out. `ok` picks the glyph and the colour; `status` is the same news in the few columns the status bar has. */
 	settled: (label: string, ok: boolean, detail: string, status: string) => void;
-	/** Takes down the pins whose news has been seen, which is what starting a turn means. A download still running keeps its pin: that one is not news, it is work in progress. */
-	release: () => void;
+	/** Takes down the pins whose news has been seen, which is what starting a turn means. Returns whether no download still needs this voice kept around. */
+	release: () => boolean;
 }
 
 /** What a pin calls this plugin: `omp-skilld` is the package, and a status bar has no columns to spare for the prefix. */
@@ -51,6 +51,8 @@ type Colour = 'accent' | 'success' | 'error';
 const pinboard = (ctx: ExtensionContext): Voice => {
 	/** The labels whose pin is settled news, which are the only ones {@link Voice.release} may take down. */
 	const seen: Record<string, true> = {};
+	/** Downloads whose working pin may settle after the current turn, so their voice must stay reachable until then. */
+	const active: Record<string, true> = {};
 
 	const key = (label: string) => `${PLUGIN_NAME}:${label}`;
 
@@ -90,12 +92,15 @@ const pinboard = (ctx: ExtensionContext): Voice => {
 			}
 		},
 		working: (label, detail) => {
+			active[label] = true;
+
 			// A source that failed last launch and is being tried again this one has an old pin standing; it is superseded, not news, so it is no longer `release`'s to take down.
 			delete seen[label];
 
 			pin(label, 'accent', '⟳', detail, 'skills');
 		},
 		settled: (label, ok, detail, status) => {
+			delete active[label];
 			seen[label] = true;
 
 			if (ok) {
@@ -110,6 +115,8 @@ const pinboard = (ctx: ExtensionContext): Voice => {
 				delete seen[label];
 				unpin(label);
 			}
+
+			return Object.keys(active).length === 0;
 		}
 	};
 };
@@ -740,7 +747,9 @@ const plugin = (pi: ExtensionAPI): void => {
 	 */
 	pi.on('turn_start', () => {
 		for (const voice of sessionVoices) {
-			voice.release();
+			if (voice.release()) {
+				sessionVoices.delete(voice);
+			}
 		}
 	});
 
