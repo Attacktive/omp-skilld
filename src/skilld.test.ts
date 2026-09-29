@@ -516,6 +516,37 @@ test(
 );
 
 test(
+	'/skilld refresh prefers an exact repository match over another source using that text as a label',
+	async () => {
+		const first = downloaded('command-repo-precedence-first', ['first-skill']);
+		const second = downloaded('command-repo-precedence-second', ['second-skill']);
+		const firstStamp = join(scratch, 'command-repo-precedence-first', 'stamp');
+		const secondStamp = join(scratch, 'command-repo-precedence-second', 'stamp');
+
+		writeFileSync(firstStamp, '');
+		writeFileSync(secondStamp, '');
+		writeFileSync(staging(first.target).failed, '');
+
+		const { heard, run, command } = listener();
+		await run({
+			sources: [
+				{ repo: 'owner/first', target: first.target, stamp: firstStamp, label: 'primary' },
+				{ repo: 'owner/second', target: second.target, stamp: secondStamp, label: 'owner/first' }
+			]
+		});
+
+		heard.length = 0;
+		await command('refresh owner/first');
+
+		expect(heard.some((toast) => toast.type === 'error' && toast.message.includes('More than one configured skill source')))
+			.toBe(false);
+
+		expect(heard.some((toast) => toast.type === 'info' && toast.message.includes('Requesting a refresh for primary')))
+			.toBe(true);
+	}
+);
+
+test(
 	'/skilld refresh rejects a source name that is not configured',
 	async () => {
 		const { target } = downloaded('command-refresh-missing', ['command-refresh-missing-skill']);
@@ -554,6 +585,46 @@ test(
 
 		expect(heard.some((toast) => toast.type === 'info' && toast.message.includes('failure cooldowns still apply')))
 			.toBe(true);
+	}
+);
+
+onPosix(
+	'/skilld refresh restores the previous freshness stamp when gh cannot start',
+	async () => {
+		const home = join(scratch, 'command-force-no-gh');
+		const bin = join(home, 'bin');
+		const target = join(home, 'target');
+		const stamp = join(home, 'stamp');
+
+		mkdirSync(bin, { recursive: true });
+		symlinkSync('/bin/sh', join(bin, 'sh'));
+		mkdirSync(join(target, 'old-skill'), { recursive: true });
+		writeFileSync(join(target, 'old-skill', 'SKILL.md'), '');
+		writeFileSync(stamp, '');
+
+		const previousPath = process.env.PATH;
+		process.env.PATH = bin;
+
+		const { heard, run, command, settleDownload } = listener();
+
+		try {
+			await run({ sources: [{ repo: 'someone/their-skills', target, stamp, label: 'missing-gh' }] });
+
+			heard.length = 0;
+			await command('refresh missing-gh');
+			await settleDownload(() => heard.some((toast) => toast.type === 'error' && toast.message.includes('not installed')));
+
+			expect(existsSync(stamp))
+				.toBe(true);
+
+			heard.length = 0;
+			await command('status');
+
+			expect(heard[heard.length - 1]?.message)
+				.toContain('missing-gh: fresh');
+		} finally {
+			process.env.PATH = previousPath;
+		}
 	}
 );
 
@@ -680,6 +751,50 @@ onPosix(
 				.toMatch(/⟳ skilld/);
 
 			await settleDownload(() => existsSync(secondStamp));
+		} finally {
+			process.env.PATH = previousPath;
+		}
+	}
+);
+
+onPosix(
+	'a settled voice from an earlier command cannot clear a newer command\'s working pin for the same label',
+	async () => {
+		const home = join(scratch, 'command-pin-generation');
+		const bin = join(home, 'bin');
+		const once = join(home, 'once');
+		const target = join(home, 'target');
+		const stamp = join(home, 'stamp');
+
+		mkdirSync(bin, { recursive: true });
+		symlinkSync('/bin/sh', join(bin, 'sh'));
+		writeFileSync(
+			join(bin, 'gh'),
+			`#!/bin/sh\nPATH=/bin:/usr/bin\nif [ -e "${once}" ]; then sleep 2; else touch "${once}"; fi\nmkdir -p "$6/manual-skill"\necho done > "$6/manual-skill/SKILL.md"\nexit 0\n`
+		);
+
+		chmodSync(join(bin, 'gh'), 0o755);
+		mkdirSync(join(target, 'old-skill'), { recursive: true });
+		writeFileSync(join(target, 'old-skill', 'SKILL.md'), '');
+		writeFileSync(stamp, '');
+
+		const previousPath = process.env.PATH;
+		process.env.PATH = bin;
+
+		const { board, run, command, settleDownload, turn } = listener();
+
+		try {
+			await run({ sources: [{ repo: 'someone/their-skills', target, stamp, label: 'generation' }] });
+			await command('refresh generation');
+			await settleDownload(() => existsSync(stamp) && existsSync(once));
+
+			await command('refresh generation');
+			turn();
+
+			expect(board.widgets[`${PLUGIN_NAME}:generation`]?.join('\n'))
+				.toMatch(/⟳ skilld/);
+
+			await settleDownload(() => existsSync(stamp));
 		} finally {
 			process.env.PATH = previousPath;
 		}

@@ -9,7 +9,7 @@
 
 import type { ExtensionAPI, ExtensionContext } from '@oh-my-pi/pi-coding-agent';
 import { spawn } from 'node:child_process';
-import { closeSync, existsSync, mkdirSync, openSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { ANNOUNCEMENT_DELAY_MS, DEFAULT_INTERVAL_MS, NOT_EXECUTABLE, NOT_FOUND, PLUGIN_NAME, asInterval, claim, complaint, reason, asSources, dropPlaceholder, installCommand, installedSkills, isEmpty, isInFlight, isSource, isStale, layout, linkSkills, normalize, readPluginSettings, resolveStaging, selectSkills, settleParked, staging, swap, sweepGuard } from './internals.ts';
@@ -48,11 +48,16 @@ const BANNER = 'skilld';
 /** The three colours a pin comes in, each one omp's own — a pin is painted by whatever theme is loaded rather than in colours of its own choosing. */
 type Colour = 'accent' | 'success' | 'error';
 
+/** The voice generation that most recently wrote each display label. */
+const pinOwners = new Map<string, object>();
+
 /**
  * Pins go in the widget strip under the editor and in the status bar, neither of which exists without a TUI.
  * Every call is guarded: a headless launch, a host whose `ctx.ui` predates widgets, or a session torn down mid-download all fall back to the log, which has the whole story regardless.
  */
 const pinboard = (ctx: ExtensionContext): Voice => {
+	const owner = {};
+
 	/** The labels whose pin is settled news, which are the only ones {@link Voice.release} may take down. */
 	const seen: Record<string, true> = {};
 	/** Active source IDs mapped to their display labels, so equal labels cannot release one another's pin. */
@@ -61,6 +66,8 @@ const pinboard = (ctx: ExtensionContext): Voice => {
 	const key = (label: string) => `${PLUGIN_NAME}:${label}`;
 
 	const pin = (label: string, colour: Colour, glyph: string, detail: string, status: string) => {
+		pinOwners.set(label, owner);
+
 		try {
 			const { theme } = ctx.ui;
 
@@ -75,6 +82,12 @@ const pinboard = (ctx: ExtensionContext): Voice => {
 	};
 
 	const unpin = (label: string) => {
+		if (pinOwners.get(label) !== owner) {
+			return;
+		}
+
+		pinOwners.delete(label);
+
 		try {
 			ctx.ui.setWidget(key(label), undefined);
 			ctx.ui.setStatus(key(label), undefined);
@@ -107,6 +120,11 @@ const pinboard = (ctx: ExtensionContext): Voice => {
 			active.delete(id);
 
 			if ([...active.values()].includes(label)) {
+				return;
+			}
+
+			const currentOwner = pinOwners.get(label);
+			if (currentOwner !== undefined && currentOwner !== owner) {
 				return;
 			}
 
@@ -386,6 +404,41 @@ const claimRefreshTarget = (source: NormalizedSource, log: Log) => {
 	return true;
 };
 
+interface StampSnapshot {
+	atime: Date;
+	mtime: Date;
+	path: string;
+}
+
+/** Remembers the last successful freshness record before a forced refresh temporarily removes it. */
+const snapshotStamp = (path: string, force: boolean): StampSnapshot | undefined => {
+	if (!force) {
+		return undefined;
+	}
+
+	try {
+		const { atime, mtime } = statSync(path);
+
+		return { atime, mtime, path };
+	} catch {
+		return undefined;
+	}
+};
+
+/** Puts the last successful freshness record back after a replacement download fails. */
+const restoreStamp = (snapshot: StampSnapshot | undefined) => {
+	if (snapshot === undefined) {
+		return;
+	}
+
+	try {
+		writeFileSync(snapshot.path, '');
+		utimesSync(snapshot.path, snapshot.atime, snapshot.mtime);
+	} catch {
+		// Losing an old freshness marker costs a redundant retry, not the installed skills themselves.
+	}
+};
+
 /** Settles old staging, republishes the current target, and decides whether this request has earned a new download. */
 const prepareRefresh = (source: NormalizedSource, dirs: Layout, staleAfter: number, voice: Voice, log: Log, force: boolean) => {
 	const { target, stamp } = source;
@@ -432,10 +485,8 @@ const prepareRefresh = (source: NormalizedSource, dirs: Layout, staleAfter: numb
 	return true;
 };
 
-/** Normalizes and claims one source, releasing the claim immediately when staging or freshness says there is no download to start. */
-const prepareConfiguredRefresh = (configured: SkillSource, dirs: Layout, staleAfter: number, voice: Voice, log: Log, force: boolean) => {
-	const source = normalize(configured, dirs.root);
-
+/** Claims one normalized source, releasing the claim immediately when staging or freshness says there is no download to start. */
+const prepareConfiguredRefresh = (source: NormalizedSource, dirs: Layout, staleAfter: number, voice: Voice, log: Log, force: boolean) => {
 	if (!claimRefreshTarget(source, log)) {
 		return undefined;
 	}
@@ -460,16 +511,21 @@ const refresh = (configured: SkillSource, dirs: Layout, staleAfter: number, voic
 	let voiceId = label;
 	let notice: Timer | undefined;
 	let claimedTarget: string | undefined;
+	let previousStamp: StampSnapshot | undefined;
 	let childOwnsClaim = false;
+	let downloadStarted = false;
 
 	try {
-		const source = prepareConfiguredRefresh(configured, dirs, staleAfter, voice, log, force);
+		const normalized = normalize(configured, dirs.root);
+		label = normalized.label;
+		voiceId = normalized.target;
+		previousStamp = snapshotStamp(normalized.stamp, force);
+
+		const source = prepareConfiguredRefresh(normalized, dirs, staleAfter, voice, log, force);
 		if (source === undefined) {
 			return;
 		}
 
-		label = source.label;
-		voiceId = source.target;
 		claimedTarget = source.target;
 
 		const { repo, target } = source;
@@ -493,6 +549,7 @@ const refresh = (configured: SkillSource, dirs: Layout, staleAfter: number, voic
 		notice = ctx.setTimeout(() => voice.toast(announcement, 'info'), ANNOUNCEMENT_DELAY_MS);
 
 		const install = download(repo, incoming, done, failed, pid, noise);
+		downloadStarted = true;
 
 		log(`${label}: downloading into ${incoming}`);
 
@@ -553,6 +610,7 @@ const refresh = (configured: SkillSource, dirs: Layout, staleAfter: number, voic
 
 		/** Every way a download that did start can fail: the log gets the detail, the toast gets the same detail in parentheses, and the pin holds it until it has been seen. */
 		const speakOnFailure = (detail: string) => () => {
+			restoreStamp(previousStamp);
 			log(`${label}: ${detail}`);
 			voice.toast(`Failed to refresh ${label} (${detail}).`, 'error');
 			voice.settled(target, label, false, `could not refresh ${label}: ${detail}`, 'refresh failed');
@@ -564,6 +622,8 @@ const refresh = (configured: SkillSource, dirs: Layout, staleAfter: number, voic
 		 */
 		const onError = (cause: unknown) => {
 			const speak = () => {
+				restoreStamp(previousStamp);
+
 				const detail = reason(cause);
 
 				log(`${label}: could not start the download: ${detail}`);
@@ -633,6 +693,10 @@ const refresh = (configured: SkillSource, dirs: Layout, staleAfter: number, voic
 	} catch (cause) {
 		if (notice !== undefined) {
 			ctx.clearTimer(notice);
+		}
+
+		if (!downloadStarted) {
+			restoreStamp(previousStamp);
 		}
 
 		log(`${label}: ${reason(cause)}`);
@@ -775,12 +839,16 @@ const matchingSources = (sources: SkillSource[], requested: string, dirs: Layout
 		return sources;
 	}
 
-	const matching = sources
-		.filter((source) => {
-			const normalized = normalize(source, dirs.root);
+	const candidates = sources
+		.map((source) => ({ source, normalized: normalize(source, dirs.root) }));
 
-			return normalized.repo === requested || normalized.label === requested;
-		});
+	let matching = candidates
+		.filter(({ normalized }) => normalized.repo === requested);
+
+	if (matching.length === 0) {
+		matching = candidates
+			.filter(({ normalized }) => normalized.label === requested);
+	}
 
 	if (matching.length === 0) {
 		voice.toast(`No configured skill source matches \`${requested}\`.`, 'error');
@@ -792,7 +860,7 @@ const matchingSources = (sources: SkillSource[], requested: string, dirs: Layout
 		return undefined;
 	}
 
-	return matching;
+	return matching.map(({ source }) => source);
 };
 
 const manualRefresh = async (requested: string, agentDir: string, cwd: string, voice: Voice, log: Log, ctx: ExtensionContext) => {
