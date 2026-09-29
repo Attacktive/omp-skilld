@@ -439,6 +439,15 @@ const restoreStamp = (snapshot: StampSnapshot | undefined) => {
 	}
 };
 
+/** Restores a removed freshness record only when no child was successfully returned to carry the refresh onward. */
+const restoreStampBeforeDownload = (snapshot: StampSnapshot | undefined, downloadStarted: boolean) => {
+	if (downloadStarted) {
+		return;
+	}
+
+	restoreStamp(snapshot);
+};
+
 /** Settles old staging, republishes the current target, and decides whether this request has earned a new download. */
 const prepareRefresh = (source: NormalizedSource, dirs: Layout, staleAfter: number, voice: Voice, log: Log, force: boolean) => {
 	const { target, stamp } = source;
@@ -695,9 +704,7 @@ const refresh = (configured: SkillSource, dirs: Layout, staleAfter: number, voic
 			ctx.clearTimer(notice);
 		}
 
-		if (!downloadStarted) {
-			restoreStamp(previousStamp);
-		}
+		restoreStampBeforeDownload(previousStamp, downloadStarted);
 
 		log(`${label}: ${reason(cause)}`);
 		voice.toast(`Could not refresh ${label}.`, 'error');
