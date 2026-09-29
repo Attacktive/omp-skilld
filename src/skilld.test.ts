@@ -58,6 +58,10 @@ interface CommandHandler {
 	(args: string, ctx: ExtensionContext): void | Promise<void>;
 }
 
+interface CommandRegistration {
+	handler: CommandHandler;
+}
+
 /** The pins standing in the stub's UI, keyed the way the plugin keys them: `undefined` is a pin taken down, which is a different thing from one never put up. */
 interface Board {
 	widgets: Record<string, string[] | undefined>;
@@ -83,7 +87,7 @@ const listener = () => {
 				onTurnStart = handler as unknown as () => void;
 			}
 		},
-		registerCommand: (name: string, options: { handler: CommandHandler }) => {
+		registerCommand: (name: string, options: CommandRegistration) => {
 			if (name === 'skilld') {
 				onSkilldCommand = options.handler;
 			}
@@ -489,6 +493,29 @@ test(
 );
 
 test(
+	'/skilld status distinguishes an abandoned staging directory from a live refresh',
+	async () => {
+		const { target } = downloaded('command-abandoned-status', ['command-abandoned-status-skill']);
+		const stamp = join(scratch, 'command-abandoned-status', 'stamp');
+
+		writeFileSync(stamp, '');
+
+		const { heard, run, command } = listener();
+		await run({ sources: [{ repo: 'someone/their-skills', target, stamp, label: 'abandoned' }] });
+
+		const { incoming, pid } = staging(target);
+		mkdirSync(incoming, { recursive: true });
+		writeFileSync(pid, '999999999');
+
+		heard.length = 0;
+		await command('status');
+
+		expect(heard[heard.length - 1]?.message)
+			.toContain('abandoned: abandoned download');
+	}
+);
+
+test(
 	'/skilld refresh rejects a source name that is not configured',
 	async () => {
 		const { target } = downloaded('command-refresh-missing', ['command-refresh-missing-skill']);
@@ -544,6 +571,7 @@ onPosix(
 			join(bin, 'gh'),
 			'#!/bin/sh\nPATH=/bin:/usr/bin\nmkdir -p "$6/manual-skill"\necho done > "$6/manual-skill/SKILL.md"\nexit 0\n'
 		);
+
 		chmodSync(join(bin, 'gh'), 0o755);
 		mkdirSync(join(target, 'old-skill'), { recursive: true });
 		writeFileSync(join(target, 'old-skill', 'SKILL.md'), '');
@@ -564,6 +592,97 @@ onPosix(
 
 		expect(existsSync(join(target, 'manual-skill', 'SKILL.md')))
 			.toBe(true);
+	}
+);
+
+onPosix(
+	'/skilld refresh serializes repeated requests before the first download creates staging',
+	async () => {
+		const home = join(scratch, 'command-refresh-race');
+		const bin = join(home, 'bin');
+		const attempts = join(home, 'attempts');
+		const target = join(home, 'target');
+		const stamp = join(home, 'stamp');
+
+		mkdirSync(bin, { recursive: true });
+		mkdirSync(attempts, { recursive: true });
+		symlinkSync('/bin/sh', join(bin, 'sh'));
+		writeFileSync(
+			join(bin, 'gh'),
+			`#!/bin/sh\nPATH=/bin:/usr/bin\ntouch "${attempts}/$$"\nsleep 1\nmkdir -p "$6/manual-skill"\necho done > "$6/manual-skill/SKILL.md"\nexit 0\n`
+		);
+
+		chmodSync(join(bin, 'gh'), 0o755);
+		mkdirSync(join(target, 'old-skill'), { recursive: true });
+		writeFileSync(join(target, 'old-skill', 'SKILL.md'), '');
+		writeFileSync(stamp, '');
+
+		const previousPath = process.env.PATH;
+		process.env.PATH = bin;
+
+		const { run, command, settleDownload } = listener();
+
+		try {
+			await run({ sources: [{ repo: 'someone/their-skills', target, stamp, label: 'serial' }] });
+			await command('refresh serial');
+			await command('refresh serial');
+			await settleDownload(() => existsSync(stamp) && existsSync(join(target, 'manual-skill', 'SKILL.md')));
+		} finally {
+			process.env.PATH = previousPath;
+		}
+
+		expect(readdirSync(attempts))
+			.toHaveLength(1);
+	}
+);
+
+onPosix(
+	'one source finishing cannot release a shared-label pin while another source is still downloading',
+	async () => {
+		const home = join(scratch, 'command-shared-label');
+		const bin = join(home, 'bin');
+		const firstTarget = join(home, 'first', 'target');
+		const firstStamp = join(home, 'first', 'stamp');
+		const secondTarget = join(home, 'second', 'target');
+		const secondStamp = join(home, 'second', 'stamp');
+
+		mkdirSync(bin, { recursive: true });
+		mkdirSync(dirname(firstStamp), { recursive: true });
+		mkdirSync(dirname(secondStamp), { recursive: true });
+		symlinkSync('/bin/sh', join(bin, 'sh'));
+		writeFileSync(
+			join(bin, 'gh'),
+			'#!/bin/sh\nPATH=/bin:/usr/bin\ncase "$6" in\n*first*) sleep 1; skill=first-skill ;;\n*) sleep 2; skill=second-skill ;;\nesac\nmkdir -p "$6/$skill"\necho done > "$6/$skill/SKILL.md"\nexit 0\n'
+		);
+
+		chmodSync(join(bin, 'gh'), 0o755);
+		writeFileSync(firstStamp, '');
+		writeFileSync(secondStamp, '');
+
+		const previousPath = process.env.PATH;
+		process.env.PATH = bin;
+
+		const { board, run, command, settleDownload, turn } = listener();
+
+		try {
+			await run({
+				sources: [
+					{ repo: 'someone/first-skills', target: firstTarget, stamp: firstStamp, label: 'shared' },
+					{ repo: 'someone/second-skills', target: secondTarget, stamp: secondStamp, label: 'shared' }
+				]
+			});
+			await command('refresh');
+			await settleDownload(() => existsSync(firstStamp) && !existsSync(secondStamp));
+
+			turn();
+
+			expect(board.widgets[`${PLUGIN_NAME}:shared`]?.join('\n'))
+				.toMatch(/⟳ skilld/);
+
+			await settleDownload(() => existsSync(secondStamp));
+		} finally {
+			process.env.PATH = previousPath;
+		}
 	}
 );
 

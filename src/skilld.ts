@@ -12,7 +12,8 @@ import { spawn } from 'node:child_process';
 import { closeSync, existsSync, mkdirSync, openSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { ANNOUNCEMENT_DELAY_MS, DEFAULT_INTERVAL_MS, NOT_EXECUTABLE, NOT_FOUND, PLUGIN_NAME, asInterval, claim, complaint, reason, asSources, dropPlaceholder, installCommand, installedSkills, isEmpty, isSource, isStale, layout, linkSkills, normalize, readPluginSettings, resolveStaging, selectSkills, settleParked, staging, swap, sweepGuard, type Layout, type NormalizedSource, type Options, type SkillSource, type StagingState } from './internals.ts';
+import { ANNOUNCEMENT_DELAY_MS, DEFAULT_INTERVAL_MS, NOT_EXECUTABLE, NOT_FOUND, PLUGIN_NAME, asInterval, claim, complaint, reason, asSources, dropPlaceholder, installCommand, installedSkills, isEmpty, isInFlight, isSource, isStale, layout, linkSkills, normalize, readPluginSettings, resolveStaging, selectSkills, settleParked, staging, swap, sweepGuard } from './internals.ts';
+import type { Layout, NormalizedSource, Options, SkillSource, StagingState } from './internals.ts';
 
 /** Exhaustive against {@link Options} by construction: a key added there refuses to compile until it is mirrored here. */
 const KNOWN_OPTIONS: Record<keyof Options, null> = { sources: null, interval: null };
@@ -31,10 +32,13 @@ interface Voice {
 	/** Fire-and-forget by design, so nothing that happens to a toast can ever surface as an error. */
 	toast: Toast;
 	/** Holds a source in view for as long as its download runs. */
-	working: (label: string, detail: string) => void;
+	working: (id: string, label: string, detail: string) => void;
 	/** Replaces a source's pin with how the refresh turned out. `ok` picks the glyph and the colour; `status` is the same news in the few columns the status bar has. */
-	settled: (label: string, ok: boolean, detail: string, status: string) => void;
-	/** Takes down the pins whose news has been seen, which is what starting a turn means. Returns whether no download still needs this voice kept around. */
+	settled: (id: string, label: string, ok: boolean, detail: string, status: string) => void;
+	/**
+	 * Takes down the pins whose news has been seen, which is what starting a turn means.
+	 * Returns whether no download still needs this voice kept around.
+	 */
 	release: () => boolean;
 }
 
@@ -51,8 +55,8 @@ type Colour = 'accent' | 'success' | 'error';
 const pinboard = (ctx: ExtensionContext): Voice => {
 	/** The labels whose pin is settled news, which are the only ones {@link Voice.release} may take down. */
 	const seen: Record<string, true> = {};
-	/** Downloads whose working pin may settle after the current turn, so their voice must stay reachable until then. */
-	const active: Record<string, true> = {};
+	/** Active source IDs mapped to their display labels, so equal labels cannot release one another's pin. */
+	const active = new Map<string, string>();
 
 	const key = (label: string) => `${PLUGIN_NAME}:${label}`;
 
@@ -91,16 +95,21 @@ const pinboard = (ctx: ExtensionContext): Voice => {
 				// The session may have ended while the refresh was still running; there is nowhere left to say it.
 			}
 		},
-		working: (label, detail) => {
-			active[label] = true;
+		working: (id, label, detail) => {
+			active.set(id, label);
 
 			// A source that failed last launch and is being tried again this one has an old pin standing; it is superseded, not news, so it is no longer `release`'s to take down.
 			delete seen[label];
 
 			pin(label, 'accent', '⟳', detail, 'skills');
 		},
-		settled: (label, ok, detail, status) => {
-			delete active[label];
+		settled: (id, label, ok, detail, status) => {
+			active.delete(id);
+
+			if ([...active.values()].includes(label)) {
+				return;
+			}
+
 			seen[label] = true;
 
 			if (ok) {
@@ -116,21 +125,54 @@ const pinboard = (ctx: ExtensionContext): Voice => {
 				unpin(label);
 			}
 
-			return Object.keys(active).length === 0;
+			return active.size === 0;
 		}
 	};
 };
 
-/** Every voice that may still own a settled pin. A manual refresh can outlive the session that started it, so a single "current" voice would strand older pins forever. */
+/**
+ * Every voice that still owns a working or settled pin.
+ * A manual refresh can outlive the session that started it, so a single "current" voice would strand older pins forever.
+ */
 const sessionVoices = new Set<Voice>();
 
 const voiceFor = (ctx: ExtensionContext) => {
-	const voice = pinboard(ctx);
+	const base = pinboard(ctx);
+	let retained = false;
 
-	sessionVoices.add(voice);
+	const voice: Voice = {
+		toast: base.toast,
+		working: (id, label, detail) => {
+			if (!retained) {
+				retained = true;
+				sessionVoices.add(voice);
+			}
+
+			base.working(id, label, detail);
+		},
+		settled: (id, label, ok, detail, status) => {
+			if (!retained) {
+				retained = true;
+				sessionVoices.add(voice);
+			}
+
+			base.settled(id, label, ok, detail, status);
+		},
+		release: () => {
+			const released = base.release();
+			if (released) {
+				retained = false;
+			}
+
+			return released;
+		}
+	};
 
 	return voice;
 };
+
+/** Targets already claimed by a refresh in this process, covering the gap before `gh` creates its staging directory. */
+const refreshingTargets = new Set<string>();
 
 /**
  * Starts the download and leaves it running.
@@ -263,7 +305,7 @@ const complete = (source: NormalizedSource, dirs: Layout, voice: Voice, log: Log
 
 		log(`${source.label}: could not install the download: ${reason(cause)}`);
 		voice.toast(`Downloaded ${source.label}, but could not install it — the skills you already had are untouched.`, 'error');
-		voice.settled(source.label, false, `downloaded ${source.label}, but could not install it — the skills you already had are untouched`, 'install failed');
+		voice.settled(source.target, source.label, false, `downloaded ${source.label}, but could not install it — the skills you already had are untouched`, 'install failed');
 
 		return;
 	}
@@ -276,7 +318,7 @@ const complete = (source: NormalizedSource, dirs: Layout, voice: Voice, log: Log
 	} catch (cause) {
 		log(`${source.label}: installed, but could not write ${stamp}: ${reason(cause)}`);
 		voice.toast(`Refreshed ${source.label}, but could not record it — expect a redundant download next launch.`, 'error');
-		voice.settled(source.label, false, `refreshed ${source.label}, but could not record it — expect a redundant download next launch`, 'stamp failed');
+		voice.settled(source.target, source.label, false, `refreshed ${source.label}, but could not record it — expect a redundant download next launch`, 'stamp failed');
 
 		return;
 	}
@@ -300,7 +342,7 @@ const complete = (source: NormalizedSource, dirs: Layout, voice: Voice, log: Log
 	}
 
 	voice.toast(message, 'info');
-	voice.settled(source.label, true, pinned, `${published} skills`);
+	voice.settled(source.target, source.label, true, pinned, `${published} skills`);
 };
 
 /** Whether the staging area leaves this launch a download to start, having said in the log what it found — and installed it, if that is what was waiting. */
@@ -332,53 +374,90 @@ const proceed = (state: StagingState, source: NormalizedSource, dirs: Layout, vo
 	}
 };
 
+/** Claims a target synchronously so two refresh requests in this process cannot both spawn a download before staging appears. */
+const claimRefreshTarget = (source: NormalizedSource, log: Log) => {
+	if (refreshingTargets.has(source.target)) {
+		log(`${source.label}: a refresh is already running in this process; leaving it alone`);
+		return false;
+	}
+
+	refreshingTargets.add(source.target);
+
+	return true;
+};
+
+/** Settles old staging, republishes the current target, and decides whether this request has earned a new download. */
+const prepareRefresh = (source: NormalizedSource, dirs: Layout, staleAfter: number, voice: Voice, log: Log, force: boolean) => {
+	const { target, stamp } = source;
+
+	/*
+	 * Only the parent, which is where staging goes.
+	 * `target` itself appears once a refresh has actually succeeded, so an interrupted one leaves nothing that reads as an installed-but-empty skill set.
+	 */
+	mkdirSync(dirname(target), { recursive: true });
+
+	/*
+	 * A parked directory can never be swapped in by the launch that parked it — that handler died with the parent — so it is settled here: discarded when the live directory stands, stood back in when a swap died between its two renames and the park is the only copy of the skills left.
+	 * Before publication, so skills recovered this way are linked on the same launch that recovers them.
+	 */
+	if (settleParked(target)) {
+		log(`${source.label}: restored the skills a failed swap left parked`);
+	}
+
+	if (existsSync(target)) {
+		publish(source, dirs.linkRoot, voice, log);
+	}
+
+	if (!proceed(resolveStaging(target, stamp, staleAfter), source, dirs, voice, log)) {
+		return false;
+	}
+
+	if (force) {
+		/*
+		 * A forced download may outlive this omp process.
+		 * Removing the old freshness record before it starts makes the completion marker authoritative to the next launch instead of looking redundant beside a still-fresh stamp.
+		 * This happens only after staging safety checks pass, so an in-flight download or failure cooldown keeps the existing stamp intact.
+		 */
+		rmSync(stamp, { force: true });
+		log(`${source.label}: forcing a refresh despite the previous freshness stamp`);
+
+		return true;
+	}
+
+	if (!isStale(stamp, staleAfter)) {
+		log(`${source.label}: refreshed within the last ${staleAfter} ms; nothing to do`);
+		return false;
+	}
+
+	return true;
+};
+
 /** Fires one source's refresh off in the background and never waits on it. */
 const refresh = (configured: SkillSource, dirs: Layout, staleAfter: number, voice: Voice, log: Log, ctx: ExtensionContext, force = false) => {
 	// The catch at the bottom needs a name for the source no matter how little of the body ran.
 	let label = JSON.stringify(configured);
-
+	let voiceId = label;
 	let notice: Timer | undefined;
+	let claimedTarget: string | undefined;
+	let childOwnsClaim = false;
 
 	try {
 		const source = normalize(configured, dirs.root);
 		label = source.label;
+		voiceId = source.target;
 
-		const { repo, target, stamp } = source;
+		if (!claimRefreshTarget(source, log)) {
+			return;
+		}
+
+		claimedTarget = source.target;
+
+		if (!prepareRefresh(source, dirs, staleAfter, voice, log, force)) {
+			return;
+		}
+
+		const { repo, target } = source;
 		const { incoming, done, failed, pid, noise } = staging(target);
-
-		/*
-		 * Only the parent, which is where staging goes.
-		 * `target` itself appears once a refresh has actually succeeded, so an interrupted one leaves nothing that reads as an installed-but-empty skill set.
-		 */
-		mkdirSync(dirname(target), { recursive: true });
-
-		/*
-		 * A parked directory can never be swapped in by the launch that parked it — that handler died with the parent — so it is settled here: discarded when the live directory stands, stood back in when a swap died between its two renames and the park is the only copy of the skills left.
-		 * Before publication, so skills recovered this way are linked on the same launch that recovers them.
-		 */
-		if (settleParked(target)) {
-			log(`${label}: restored the skills a failed swap left parked`);
-		}
-
-		if (existsSync(target)) {
-			publish(source, dirs.linkRoot, voice, log);
-		}
-
-		if (!proceed(resolveStaging(target, stamp, staleAfter), source, dirs, voice, log)) {
-			return;
-		}
-
-		if (force) {
-			/*
-			 * A forced download may outlive this omp process. Removing the old freshness record before it starts makes the completion marker authoritative to the next launch instead of looking redundant beside a still-fresh stamp.
-			 * This happens only after staging safety checks pass, so an in-flight download or failure cooldown keeps the existing stamp intact.
-			 */
-			rmSync(stamp, { force: true });
-			log(`${label}: forcing a refresh despite the previous freshness stamp`);
-		} else if (!isStale(stamp, staleAfter)) {
-			log(`${label}: refreshed within the last ${staleAfter} ms; nothing to do`);
-			return;
-		}
 
 		let announcement = `Refreshing ${label} from GitHub in the background.\nCarry on working — you will get a second message once it is done.`;
 
@@ -404,7 +483,7 @@ const refresh = (configured: SkillSource, dirs: Layout, staleAfter: number, voic
 		/*
 		 * Unlike the announcement, which waits out the delay: a pin costs a line under the editor rather than a notification, and a download that fails in milliseconds simply replaces it with why.
 		 */
-		voice.working(label, progress);
+		voice.working(target, label, progress);
 
 		// Node warns that `exit` may or may not follow `error`, so whichever fires first speaks for the child.
 		let settled = false;
@@ -419,6 +498,7 @@ const refresh = (configured: SkillSource, dirs: Layout, staleAfter: number, voic
 			}
 
 			settled = true;
+			refreshingTargets.delete(target);
 
 			try {
 				// The child is gone whichever way this was reached, so the liveness marker goes with it.
@@ -459,7 +539,7 @@ const refresh = (configured: SkillSource, dirs: Layout, staleAfter: number, voic
 		const speakOnFailure = (detail: string) => () => {
 			log(`${label}: ${detail}`);
 			voice.toast(`Failed to refresh ${label} (${detail}).`, 'error');
-			voice.settled(label, false, `could not refresh ${label}: ${detail}`, 'refresh failed');
+			voice.settled(target, label, false, `could not refresh ${label}: ${detail}`, 'refresh failed');
 		};
 
 		/**
@@ -472,7 +552,7 @@ const refresh = (configured: SkillSource, dirs: Layout, staleAfter: number, voic
 
 				log(`${label}: could not start the download: ${detail}`);
 				voice.toast(`Could not refresh ${label}: ${detail}`, 'error');
-				voice.settled(label, false, `could not start the download for ${label}: ${detail}`, 'refresh failed');
+				voice.settled(target, label, false, `could not start the download for ${label}: ${detail}`, 'refresh failed');
 			};
 
 			finish(speak);
@@ -527,6 +607,7 @@ const refresh = (configured: SkillSource, dirs: Layout, staleAfter: number, voic
 
 		install.on('error', onError);
 		install.on('exit', onExit);
+		childOwnsClaim = true;
 
 		/*
 		* Quitting omp must never wait on a download, so the child is unreferenced — orphaned rather than killed.
@@ -540,7 +621,11 @@ const refresh = (configured: SkillSource, dirs: Layout, staleAfter: number, voic
 
 		log(`${label}: ${reason(cause)}`);
 		voice.toast(`Could not refresh ${label}.`, 'error');
-		voice.settled(label, false, `could not refresh ${label}`, 'refresh failed');
+		voice.settled(voiceId, label, false, `could not refresh ${label}`, 'refresh failed');
+	} finally {
+		if (claimedTarget !== undefined && !childOwnsClaim) {
+			refreshingTargets.delete(claimedTarget);
+		}
 	}
 };
 
@@ -557,7 +642,8 @@ const configuration = async (cwd: string, voice: Voice, log: Log): Promise<Confi
 		return undefined;
 	}
 
-	// A typo'd key would otherwise make the plugin indistinguishable from one that was never configured. Own properties only, or a key like `toString` would slip through by inheritance.
+	// A typo'd key would otherwise make the plugin indistinguishable from one that was never configured.
+	// Own properties only, or a key like `toString` would slip through by inheritance.
 	const strangers = Object.keys(given)
 		.filter((key) => !Object.hasOwn(KNOWN_OPTIONS, key));
 
@@ -569,6 +655,7 @@ const configuration = async (cwd: string, voice: Voice, log: Log): Promise<Confi
 	if (configuredSources === undefined) {
 		log(`\`sources\` is neither a list of repositories nor JSON describing one: ${JSON.stringify(given.sources)}`);
 		voice.toast('Ignoring `sources`: it has to be a list of repositories, such as `anthropics/skills`.', 'error');
+
 		return undefined;
 	}
 
@@ -606,7 +693,11 @@ const publishedSkillCount = (source: NormalizedSource, dirs: Layout) => {
 };
 
 const sourceStatus = (source: NormalizedSource, staleAfter: number) => {
-	const { incoming, done, failed, noise } = staging(source.target);
+	const { incoming, done, failed, pid, noise } = staging(source.target);
+
+	if (refreshingTargets.has(source.target)) {
+		return 'refreshing';
+	}
 
 	if (existsSync(done)) {
 		return 'download ready to install';
@@ -622,7 +713,11 @@ const sourceStatus = (source: NormalizedSource, staleAfter: number) => {
 	}
 
 	if (existsSync(incoming)) {
-		return 'refreshing';
+		if (isInFlight(incoming, pid)) {
+			return 'refreshing';
+		}
+
+		return 'abandoned download';
 	}
 
 	if (!existsSync(source.stamp)) {
@@ -655,6 +750,31 @@ const showStatus = async (agentDir: string, cwd: string, voice: Voice, log: Log)
 	voice.toast(lines.join('\n'), 'info');
 };
 
+const matchingSources = (sources: SkillSource[], requested: string, dirs: Layout, voice: Voice) => {
+	if (requested.length === 0) {
+		return sources;
+	}
+
+	const matching = sources
+		.filter((source) => {
+			const normalized = normalize(source, dirs.root);
+
+			return normalized.repo === requested || normalized.label === requested;
+		});
+
+	if (matching.length === 0) {
+		voice.toast(`No configured skill source matches \`${requested}\`.`, 'error');
+		return undefined;
+	}
+
+	if (matching.length > 1) {
+		voice.toast(`More than one configured skill source matches \`${requested}\`; use an exact repository name or a unique label.`, 'error');
+		return undefined;
+	}
+
+	return matching;
+};
+
 const manualRefresh = async (requested: string, agentDir: string, cwd: string, voice: Voice, log: Log, ctx: ExtensionContext) => {
 	const configured = await configuration(cwd, voice, log);
 	if (configured === undefined) {
@@ -667,47 +787,21 @@ const manualRefresh = async (requested: string, agentDir: string, cwd: string, v
 	}
 
 	const dirs = layout(agentDir);
-	let sources = configured.sources;
-
-	if (requested.length > 0) {
-		sources = configured.sources
-			.filter((source) => {
-				const normalized = normalize(source, dirs.root);
-
-				return normalized.repo === requested || normalized.label === requested;
-			});
-
-		if (sources.length === 0) {
-			voice.toast(`No configured skill source matches \`${requested}\`.`, 'error');
-			return;
-		}
-
-		if (sources.length > 1) {
-			voice.toast(`More than one configured skill source matches \`${requested}\`; use an exact repository name or a unique label.`, 'error');
-			return;
-		}
+	const sources = matchingSources(configured.sources, requested, dirs, voice);
+	if (sources === undefined) {
+		return;
 	}
 
-	let subject: string;
+	let subject = `${sources.length} sources`;
 	const [onlySource] = sources;
 	if (sources.length === 1 && onlySource !== undefined) {
 		subject = normalize(onlySource, dirs.root).label;
-	} else {
-		subject = `${sources.length} sources`;
 	}
 
 	voice.toast(`Requesting a refresh for ${subject}. Existing in-flight downloads and failure cooldowns still apply.`, 'info');
 
 	for (const source of sources) {
-		refresh(
-			source,
-			dirs,
-			configured.staleAfter,
-			voice,
-			log,
-			ctx,
-			true
-		);
+		refresh(source, dirs, configured.staleAfter, voice, log, ctx, true);
 	}
 };
 
@@ -753,36 +847,33 @@ const plugin = (pi: ExtensionAPI): void => {
 		}
 	});
 
-	pi.registerCommand('skilld', {
-		description: 'Show skill source status or refresh sources',
-		handler: async (args, ctx) => {
-			const command = args.trim();
-			const voice = voiceFor(ctx);
-			const log = logger(pi);
-			const agentDir = agentDirectory(pi);
+	pi.registerCommand(
+		'skilld',
+		{
+			description: 'Show skill source status or refresh sources',
+			handler: async (args, ctx) => {
+				const command = args.trim();
+				const voice = voiceFor(ctx);
+				const log = logger(pi);
+				const agentDir = agentDirectory(pi);
 
-			if (command.length === 0 || command === 'status') {
-				await showStatus(agentDir, ctx.cwd, voice, log);
-				return;
+				if (command.length === 0 || command === 'status') {
+					await showStatus(agentDir, ctx.cwd, voice, log);
+					return;
+				}
+
+				if (command === 'refresh' || command.startsWith('refresh ')) {
+					const requested = command.slice('refresh'.length).trim();
+
+					await manualRefresh(requested, agentDir, ctx.cwd, voice, log, ctx);
+
+					return;
+				}
+
+				voice.toast('Usage: /skilld [status | refresh [repository-or-label]]', 'error');
 			}
-
-			if (command === 'refresh' || command.startsWith('refresh ')) {
-				const requested = command.slice('refresh'.length).trim();
-
-				await manualRefresh(
-					requested,
-					agentDir,
-					ctx.cwd,
-					voice,
-					log,
-					ctx
-				);
-				return;
-			}
-
-			voice.toast('Usage: /skilld [status | refresh [repository-or-label]]', 'error');
 		}
-	});
+	);
 
 	/*
 	 * The extension factory runs once per session — subagents included — so the sweep is guarded to once per process.
