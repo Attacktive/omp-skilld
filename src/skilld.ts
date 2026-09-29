@@ -561,7 +561,7 @@ const configuration = async (cwd: string, voice: Voice, log: Log): Promise<Confi
 	const configuredSources = asSources(given.sources ?? []);
 	if (configuredSources === undefined) {
 		log(`\`sources\` is neither a list of repositories nor JSON describing one: ${JSON.stringify(given.sources)}`);
-		voice.toast('Ignoring \`sources\`: it has to be a list of repositories, such as \`anthropics/skills\`.', 'error');
+		voice.toast('Ignoring `sources`: it has to be a list of repositories, such as `anthropics/skills`.', 'error');
 		return undefined;
 	}
 
