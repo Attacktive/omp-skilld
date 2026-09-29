@@ -12,7 +12,7 @@ import { spawn } from 'node:child_process';
 import { closeSync, existsSync, mkdirSync, openSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { ANNOUNCEMENT_DELAY_MS, DEFAULT_INTERVAL_MS, NOT_EXECUTABLE, NOT_FOUND, PLUGIN_NAME, asInterval, complaint, reason, asSources, dropPlaceholder, installCommand, isEmpty, isSource, isStale, layout, linkSkills, normalize, readPluginSettings, resolveStaging, settleParked, staging, swap, sweepGuard, type Layout, type NormalizedSource, type Options, type SkillSource, type StagingState } from './internals.ts';
+import { ANNOUNCEMENT_DELAY_MS, DEFAULT_INTERVAL_MS, NOT_EXECUTABLE, NOT_FOUND, PLUGIN_NAME, asInterval, claim, complaint, reason, asSources, dropPlaceholder, installCommand, installedSkills, isEmpty, isSource, isStale, layout, linkSkills, normalize, readPluginSettings, resolveStaging, selectSkills, settleParked, staging, swap, sweepGuard, type Layout, type NormalizedSource, type Options, type SkillSource, type StagingState } from './internals.ts';
 
 /** Exhaustive against {@link Options} by construction: a key added there refuses to compile until it is mirrored here. */
 const KNOWN_OPTIONS: Record<keyof Options, null> = { sources: null, interval: null };
@@ -114,8 +114,16 @@ const pinboard = (ctx: ExtensionContext): Voice => {
 	};
 };
 
-/** The voice of the session that ran the sweep, so the `turn_start` handler — registered at load, which is the only place registration belongs — can reach the pins that sweep put up. */
-let sessionVoice: Voice | undefined;
+/** Every voice that may still own a settled pin. A manual refresh can outlive the session that started it, so a single "current" voice would strand older pins forever. */
+const sessionVoices = new Set<Voice>();
+
+const voiceFor = (ctx: ExtensionContext) => {
+	const voice = pinboard(ctx);
+
+	sessionVoices.add(voice);
+
+	return voice;
+};
 
 /**
  * Starts the download and leaves it running.
@@ -318,7 +326,7 @@ const proceed = (state: StagingState, source: NormalizedSource, dirs: Layout, vo
 };
 
 /** Fires one source's refresh off in the background and never waits on it. */
-const refresh = (configured: SkillSource, dirs: Layout, staleAfter: number, voice: Voice, log: Log, ctx: ExtensionContext) => {
+const refresh = (configured: SkillSource, dirs: Layout, staleAfter: number, voice: Voice, log: Log, ctx: ExtensionContext, force = false) => {
 	// The catch at the bottom needs a name for the source no matter how little of the body ran.
 	let label = JSON.stringify(configured);
 
@@ -353,7 +361,14 @@ const refresh = (configured: SkillSource, dirs: Layout, staleAfter: number, voic
 			return;
 		}
 
-		if (!isStale(stamp, staleAfter)) {
+		if (force) {
+			/*
+			 * A forced download may outlive this omp process. Removing the old freshness record before it starts makes the completion marker authoritative to the next launch instead of looking redundant beside a still-fresh stamp.
+			 * This happens only after staging safety checks pass, so an in-flight download or failure cooldown keeps the existing stamp intact.
+			 */
+			rmSync(stamp, { force: true });
+			log(`${label}: forcing a refresh despite the previous freshness stamp`);
+		} else if (!isStale(stamp, staleAfter)) {
 			log(`${label}: refreshed within the last ${staleAfter} ms; nothing to do`);
 			return;
 		}
@@ -522,13 +537,17 @@ const refresh = (configured: SkillSource, dirs: Layout, staleAfter: number, voic
 	}
 };
 
-const sweep = async (agentDir: string, cwd: string, voice: Voice, log: Log, ctx: ExtensionContext) => {
-	const { options: given, error } = await readPluginSettings(cwd);
+interface Configuration {
+	sources: SkillSource[];
+	staleAfter: number;
+}
 
+const configuration = async (cwd: string, voice: Voice, log: Log): Promise<Configuration | undefined> => {
+	const { options: given, error } = await readPluginSettings(cwd);
 	if (error !== undefined) {
 		log(`could not read the settings: ${error}`);
 		voice.toast(`Could not read the ${PLUGIN_NAME} settings: ${error}`, 'error');
-		return;
+		return undefined;
 	}
 
 	// A typo'd key would otherwise make the plugin indistinguishable from one that was never configured. Own properties only, or a key like `toString` would slip through by inheritance.
@@ -539,31 +558,178 @@ const sweep = async (agentDir: string, cwd: string, voice: Voice, log: Log, ctx:
 		voice.toast(`Ignoring unknown options: ${strangers.map((stranger) => `\`${stranger}\``).join(', ')}. The options are \`sources\` and \`interval\`.`, 'error');
 	}
 
-	const sources = asSources(given.sources ?? []);
-
-	if (sources === undefined) {
+	const configuredSources = asSources(given.sources ?? []);
+	if (configuredSources === undefined) {
 		log(`\`sources\` is neither a list of repositories nor JSON describing one: ${JSON.stringify(given.sources)}`);
-		voice.toast('Ignoring `sources`: it has to be a list of repositories, such as `anthropics/skills`.', 'error');
-		return;
+		voice.toast('Ignoring \`sources\`: it has to be a list of repositories, such as \`anthropics/skills\`.', 'error');
+		return undefined;
 	}
 
 	let staleAfter = asInterval(given.interval);
-
 	if (staleAfter === undefined) {
 		voice.toast(`Ignoring \`interval\`: ${JSON.stringify(given.interval)} is not a number of milliseconds.`, 'error');
 		staleAfter = DEFAULT_INTERVAL_MS;
 	}
 
-	const dirs = layout(agentDir);
+	const sources: SkillSource[] = [];
 
-	for (const configured of sources) {
+	for (const configured of configuredSources) {
 		if (!isSource(configured)) {
 			log(`ignoring a malformed source: ${JSON.stringify(configured)}`);
 			voice.toast(`Ignoring a malformed source: ${JSON.stringify(configured)}. A source is an \`owner/repo\`, or an object with \`repo\`, optional \`target\`/\`stamp\`/\`label\` strings, \`placeholder\` as a directory name or false, and \`include\`/\`exclude\` arrays of exact skill names.`, 'error');
 			continue;
 		}
 
-		refresh(configured, dirs, staleAfter, voice, log, ctx);
+		sources.push(configured);
+	}
+
+	return { sources, staleAfter };
+};
+
+const publishedSkillCount = (source: NormalizedSource, dirs: Layout) => {
+	try {
+		const { skills } = selectSkills(installedSkills(source.target), source);
+
+		return skills
+			.filter((name) => claim(join(dirs.linkRoot, name), source.target) === 'ours')
+			.length;
+	} catch {
+		return 0;
+	}
+};
+
+const sourceStatus = (source: NormalizedSource, staleAfter: number) => {
+	const { incoming, done, failed, noise } = staging(source.target);
+
+	if (existsSync(done)) {
+		return 'download ready to install';
+	}
+
+	if (existsSync(failed)) {
+		const detail = complaint(noise);
+		if (detail !== undefined) {
+			return `last refresh failed · ${detail}`;
+		}
+
+		return 'last refresh failed';
+	}
+
+	if (existsSync(incoming)) {
+		return 'refreshing';
+	}
+
+	if (!existsSync(source.stamp)) {
+		return 'never refreshed';
+	}
+
+	if (isStale(source.stamp, staleAfter)) {
+		return 'stale';
+	}
+
+	return 'fresh';
+};
+
+const showStatus = async (agentDir: string, cwd: string, voice: Voice, log: Log) => {
+	const configured = await configuration(cwd, voice, log);
+	if (configured === undefined) {
+		return;
+	}
+
+	if (configured.sources.length === 0) {
+		voice.toast('No skill sources are configured.', 'info');
+		return;
+	}
+
+	const dirs = layout(agentDir);
+	const lines = configured.sources
+		.map((source) => normalize(source, dirs.root))
+		.map((source) => `${source.label}: ${sourceStatus(source, configured.staleAfter)} · ${publishedSkillCount(source, dirs)} published skill(s)`);
+
+	voice.toast(lines.join('\n'), 'info');
+};
+
+const manualRefresh = async (requested: string, agentDir: string, cwd: string, voice: Voice, log: Log, ctx: ExtensionContext) => {
+	const configured = await configuration(cwd, voice, log);
+	if (configured === undefined) {
+		return;
+	}
+
+	if (configured.sources.length === 0) {
+		voice.toast('No skill sources are configured.', 'info');
+		return;
+	}
+
+	const dirs = layout(agentDir);
+	let sources = configured.sources;
+
+	if (requested.length > 0) {
+		sources = configured.sources
+			.filter((source) => {
+				const normalized = normalize(source, dirs.root);
+
+				return normalized.repo === requested || normalized.label === requested;
+			});
+
+		if (sources.length === 0) {
+			voice.toast(`No configured skill source matches \`${requested}\`.`, 'error');
+			return;
+		}
+
+		if (sources.length > 1) {
+			voice.toast(`More than one configured skill source matches \`${requested}\`; use an exact repository name or a unique label.`, 'error');
+			return;
+		}
+	}
+
+	let subject: string;
+
+	if (sources.length === 1) {
+		subject = normalize(sources[0], dirs.root).label;
+	} else {
+		subject = `${sources.length} sources`;
+	}
+
+	voice.toast(`Requesting a refresh for ${subject}. Existing in-flight downloads and failure cooldowns still apply.`, 'info');
+
+	for (const source of sources) {
+		refresh(
+			source,
+			dirs,
+			configured.staleAfter,
+			voice,
+			log,
+			ctx,
+			true
+		);
+	}
+};
+
+const sweep = async (agentDir: string, cwd: string, voice: Voice, log: Log, ctx: ExtensionContext) => {
+	const configured = await configuration(cwd, voice, log);
+	if (configured === undefined) {
+		return;
+	}
+
+	const dirs = layout(agentDir);
+
+	for (const source of configured.sources) {
+		refresh(source, dirs, configured.staleAfter, voice, log, ctx);
+	}
+};
+
+const agentDirectory = (pi: ExtensionAPI) => {
+	try {
+		return pi.pi.settings.getAgentDir();
+	} catch {
+		return process.env.PI_CODING_AGENT_DIR ?? join(homedir(), '.omp', 'agent');
+	}
+};
+
+const logger = (pi: ExtensionAPI): Log => (message) => {
+	try {
+		pi.pi.logger.info(`[${PLUGIN_NAME}] ${message}`);
+	} catch {
+		// A plugin that cannot log is still a plugin that refreshes skills.
 	}
 };
 
@@ -572,7 +738,42 @@ const plugin = (pi: ExtensionAPI): void => {
 	 * A settled pin is news until the user gets back to work, and starting a turn is what that looks like.
 	 * Registered here rather than from inside `session_start`, since the load phase is where omp takes registrations.
 	 */
-	pi.on('turn_start', () => sessionVoice?.release());
+	pi.on('turn_start', () => {
+		for (const voice of sessionVoices) {
+			voice.release();
+		}
+	});
+
+	pi.registerCommand('skilld', {
+		description: 'Show skill source status or refresh sources',
+		handler: async (args, ctx) => {
+			const command = args.trim();
+			const voice = voiceFor(ctx);
+			const log = logger(pi);
+			const agentDir = agentDirectory(pi);
+
+			if (command.length === 0 || command === 'status') {
+				await showStatus(agentDir, ctx.cwd, voice, log);
+				return;
+			}
+
+			if (command === 'refresh' || command.startsWith('refresh ')) {
+				const requested = command.slice('refresh'.length).trim();
+
+				await manualRefresh(
+					requested,
+					agentDir,
+					ctx.cwd,
+					voice,
+					log,
+					ctx
+				);
+				return;
+			}
+
+			voice.toast('Usage: /skilld [status | refresh [repository-or-label]]', 'error');
+		}
+	});
 
 	/*
 	 * The extension factory runs once per session — subagents included — so the sweep is guarded to once per process.
@@ -585,26 +786,16 @@ const plugin = (pi: ExtensionAPI): void => {
 
 		sweepGuard.done = true;
 
-		let agentDir: string;
-
-		try {
-			agentDir = pi.pi.settings.getAgentDir();
-		} catch {
-			agentDir = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), '.omp', 'agent');
-		}
-
-		const log: Log = (message) => {
-			try {
-				pi.pi.logger.info(`[${PLUGIN_NAME}] ${message}`);
-			} catch {
-				// A plugin that cannot log is still a plugin that refreshes skills.
-			}
-		};
-
-		sessionVoice = pinboard(ctx);
+		const voice = voiceFor(ctx);
 
 		// Recorded rather than awaited: the launch never waits on the sweep, but the tests need to.
-		sweepGuard.settled = sweep(agentDir, ctx.cwd, sessionVoice, log, ctx);
+		sweepGuard.settled = sweep(
+			agentDirectory(pi),
+			ctx.cwd,
+			voice,
+			logger(pi),
+			ctx
+		);
 	});
 };
 

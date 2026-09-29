@@ -742,4 +742,4 @@ const readPluginSettings = async (cwd: string): Promise<{ options: Record<string
 	}
 };
 
-export { DEFAULT_INTERVAL_MS, ANNOUNCEMENT_DELAY_MS, DEFAULT_PLACEHOLDER, ABANDONED_MS, FAILURE_COOLDOWN_MS, NOT_FOUND, NOT_EXECUTABLE, PLUGIN_NAME, type SkillRepository, type SkillSource, type Options, type NormalizedSource, type StagingState, type Layout, slugify, reason, complaint, expand, asInterval, asPlaceholder, asSources, isRepo, isSource, layout, normalize, staging, installCommand, settleParked, swap, isStale, isEmpty, dropPlaceholder, selectSkills, linkSkills, unlink, resolveStaging, readPluginSettings };
+export { DEFAULT_INTERVAL_MS, ANNOUNCEMENT_DELAY_MS, DEFAULT_PLACEHOLDER, ABANDONED_MS, FAILURE_COOLDOWN_MS, NOT_FOUND, NOT_EXECUTABLE, PLUGIN_NAME, type SkillRepository, type SkillSource, type Options, type NormalizedSource, type StagingState, type Layout, slugify, reason, complaint, expand, asInterval, asPlaceholder, asSources, isRepo, isSource, layout, normalize, staging, installCommand, settleParked, swap, isStale, isEmpty, dropPlaceholder, installedSkills, selectSkills, claim, linkSkills, unlink, resolveStaging, readPluginSettings };

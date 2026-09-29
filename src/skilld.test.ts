@@ -54,6 +54,10 @@ interface SessionStartHandler {
 	(event: unknown, ctx: ExtensionContext): void | Promise<void>;
 }
 
+interface CommandHandler {
+	(args: string, ctx: ExtensionContext): void | Promise<void>;
+}
+
 /** The pins standing in the stub's UI, keyed the way the plugin keys them: `undefined` is a pin taken down, which is a different thing from one never put up. */
 interface Board {
 	widgets: Record<string, string[] | undefined>;
@@ -67,6 +71,7 @@ const listener = () => {
 
 	let onSessionStart: SessionStartHandler | undefined;
 	let onTurnStart: (() => void) | undefined;
+	let onSkilldCommand: CommandHandler | undefined;
 
 	const piStub = {
 		on: (event: string, handler: SessionStartHandler) => {
@@ -76,6 +81,11 @@ const listener = () => {
 
 			if (event === 'turn_start') {
 				onTurnStart = handler as unknown as () => void;
+			}
+		},
+		registerCommand: (name: string, options: { handler: CommandHandler }) => {
+			if (name === 'skilld') {
+				onSkilldCommand = options.handler;
 			}
 		},
 		pi: { settings: { getAgentDir: () => join(scratch, 'agent') } }
@@ -162,8 +172,13 @@ const listener = () => {
 		flush();
 	};
 
+	const command = async (args: string) => {
+		await onSkilldCommand?.(args, ctxStub);
+		flush();
+	};
+
 	/** `turn` is the user getting back to work, which is omp's cue for the plugin to take its settled pins down. */
-	return { heard, board, run, settleDownload, turn: () => onTurnStart?.() };
+	return { heard, board, run, command, settleDownload, turn: () => onTurnStart?.() };
 };
 
 /**
@@ -426,6 +441,145 @@ const downloaded = (name: string, skills: string[]) => {
 
 	return { target, linkRoot };
 };
+
+test(
+	'/skilld defaults to status and reports freshness plus the number of skills this source actually publishes',
+	async () => {
+		const { target } = downloaded('command-status', ['command-status-skill']);
+		const stamp = join(scratch, 'command-status', 'stamp');
+		const published = join(scratch, 'agent', 'skills', 'command-status-skill');
+
+		writeFileSync(stamp, '');
+
+		const { heard, run, command } = listener();
+		await run({ sources: [{ repo: 'someone/their-skills', target, stamp, label: 'docs' }] });
+
+		heard.length = 0;
+		await command('');
+
+		expect(heard[heard.length - 1])
+			.toEqual({ message: 'docs: fresh · 1 published skill(s)', type: 'info' });
+
+		expect(readlinkSync(published))
+			.toBe(join(target, 'command-status-skill'));
+	}
+);
+
+test(
+	'/skilld status surfaces the last download complaint when a failure marker is still relevant',
+	async () => {
+		const { target } = downloaded('command-failure-status', ['command-failure-status-skill']);
+		const stamp = join(scratch, 'command-failure-status', 'stamp');
+		const failed = staging(target).failed;
+		const noise = staging(target).noise;
+
+		writeFileSync(stamp, '');
+		writeFileSync(failed, '');
+		writeFileSync(noise, 'authentication expired\n');
+
+		const { heard, run, command } = listener();
+		await run({ sources: [{ repo: 'someone/their-skills', target, stamp, label: 'broken' }] });
+
+		heard.length = 0;
+		await command('status');
+
+		expect(heard[heard.length - 1]?.message)
+			.toContain('broken: last refresh failed · authentication expired');
+	}
+);
+
+test(
+	'/skilld refresh rejects a source name that is not configured',
+	async () => {
+		const { target } = downloaded('command-refresh-missing', ['command-refresh-missing-skill']);
+		const stamp = join(scratch, 'command-refresh-missing', 'stamp');
+
+		writeFileSync(stamp, '');
+
+		const { heard, run, command } = listener();
+		await run({ sources: [{ repo: 'someone/their-skills', target, stamp }] });
+
+		heard.length = 0;
+		await command('refresh nobody/there');
+
+		expect(heard[heard.length - 1])
+			.toEqual({ message: 'No configured skill source matches `nobody/there`.', type: 'error' });
+	}
+);
+
+test(
+	'/skilld refresh leaves a fresh stamp intact when the existing failure cooldown blocks another attempt',
+	async () => {
+		const { target } = downloaded('command-refresh-cooling', ['command-refresh-cooling-skill']);
+		const stamp = join(scratch, 'command-refresh-cooling', 'stamp');
+
+		writeFileSync(stamp, '');
+		writeFileSync(staging(target).failed, '');
+
+		const { heard, run, command } = listener();
+		await run({ sources: [{ repo: 'someone/their-skills', target, stamp, label: 'cooling' }] });
+
+		heard.length = 0;
+		await command('refresh cooling');
+
+		expect(existsSync(stamp))
+			.toBe(true);
+
+		expect(heard.some((toast) => toast.type === 'info' && toast.message.includes('failure cooldowns still apply')))
+			.toBe(true);
+	}
+);
+
+onPosix(
+	'/skilld refresh bypasses freshness and the forced download still installs through the normal staging path',
+	async () => {
+		const home = join(scratch, 'command-force');
+		const bin = join(home, 'bin');
+		const target = join(home, 'target');
+		const stamp = join(home, 'stamp');
+
+		mkdirSync(bin, { recursive: true });
+		symlinkSync('/bin/sh', join(bin, 'sh'));
+		writeFileSync(
+			join(bin, 'gh'),
+			'#!/bin/sh\nPATH=/bin:/usr/bin\nmkdir -p "$6/manual-skill"\necho done > "$6/manual-skill/SKILL.md"\nexit 0\n'
+		);
+		chmodSync(join(bin, 'gh'), 0o755);
+		mkdirSync(join(target, 'old-skill'), { recursive: true });
+		writeFileSync(join(target, 'old-skill', 'SKILL.md'), '');
+		writeFileSync(stamp, '');
+
+		const previousPath = process.env.PATH;
+		process.env.PATH = bin;
+
+		const { run, command, settleDownload } = listener();
+
+		try {
+			await run({ sources: [{ repo: 'someone/their-skills', target, stamp, label: 'manual' }] });
+			await command('refresh manual');
+			await settleDownload(() => existsSync(stamp) && existsSync(join(target, 'manual-skill', 'SKILL.md')));
+		} finally {
+			process.env.PATH = previousPath;
+		}
+
+		expect(existsSync(join(target, 'manual-skill', 'SKILL.md')))
+			.toBe(true);
+	}
+);
+
+test(
+	'/skilld rejects unknown subcommands with the command usage',
+	async () => {
+		const { heard, run, command } = listener();
+		await run({ sources: [] });
+
+		heard.length = 0;
+		await command('dance');
+
+		expect(heard[heard.length - 1])
+			.toEqual({ message: 'Usage: /skilld [status | refresh [repository-or-label]]', type: 'error' });
+	}
+);
 
 test(
 	'linkSkills publishes every downloaded skill, and only the ones that are skills',

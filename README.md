@@ -94,6 +94,24 @@ omp plugin config set omp-skilld sources '[{"repo": "anthropics/skills", "target
 
 With no `sources`, the plugin does nothing at all.
 
+## Command
+
+Skilld registers a small control surface inside OMP:
+
+```text
+/skilld
+/skilld status
+/skilld refresh
+/skilld refresh anthropics/skills
+```
+
+`/skilld` and `/skilld status` report each configured source as fresh, stale, refreshing, waiting to install, failed, or never refreshed, together with how many of that source's skills are actually published into OMP's skills directory.
+A retained download complaint is shown beside a failed source when `gh` left one.
+
+`/skilld refresh` forces every configured source past the normal freshness interval, and `/skilld refresh <repository-or-label>` targets one source by its exact repository or configured label.
+The command still respects an in-flight download and the existing failure cooldown.
+The refresh remains fire-and-forget: the command returns immediately, the usual pin/toast reports progress, and a download that outlives OMP is picked up on the next launch exactly like an automatic refresh.
+
 ## Options
 
 | Option     | Default           | Meaning                                                                                                        |
