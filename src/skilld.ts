@@ -682,9 +682,9 @@ const manualRefresh = async (requested: string, agentDir: string, cwd: string, v
 	}
 
 	let subject: string;
-
-	if (sources.length === 1) {
-		subject = normalize(sources[0], dirs.root).label;
+	const [onlySource] = sources;
+	if (sources.length === 1 && onlySource !== undefined) {
+		subject = normalize(onlySource, dirs.root).label;
 	} else {
 		subject = `${sources.length} sources`;
 	}
