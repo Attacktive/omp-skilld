@@ -12,7 +12,7 @@ import { spawn } from 'node:child_process';
 import { closeSync, existsSync, mkdirSync, openSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { ANNOUNCEMENT_DELAY_MS, DEFAULT_INTERVAL_MS, NOT_EXECUTABLE, NOT_FOUND, PLUGIN_NAME, asInterval, claim, complaint, reason, asSources, dropPlaceholder, installCommand, installedSkills, isEmpty, isInFlight, isSource, isStale, layout, linkSkills, normalize, readPluginSettings, resolveStaging, selectSkills, settleParked, staging, swap, sweepGuard } from './internals.ts';
+import { ANNOUNCEMENT_DELAY_MS, DEFAULT_INTERVAL_MS, NOT_EXECUTABLE, NOT_FOUND, PLUGIN_NAME, asInterval, claim, complaint, reason, asSources, dropPlaceholder, installArguments, installCommand, installedSkills, isEmpty, isInFlight, isSource, isStale, layout, linkSkills, normalize, readPluginSettings, resolveStaging, selectSkills, settleParked, staging, swap, sweepGuard } from './internals.ts';
 import type { Layout, NormalizedSource, Options, SkillSource, StagingState } from './internals.ts';
 
 /** Exhaustive against {@link Options} by construction: a key added there refuses to compile until it is mirrored here. */
@@ -220,7 +220,7 @@ const refreshingTargets = new Set<string>();
  * A shell wraps `gh` only so that something which outlives this process can record how the download ended; the plugin's own handlers die with the parent.
  * Windows does not reap children with their parent, so there `gh` is spawned directly and the markers are the launch's own business.
  */
-const download = (repo: string, incoming: string, done: string, failed: string, pid: string, noise: string) => {
+const download = (repo: string, pin: string | undefined, incoming: string, done: string, failed: string, pid: string, noise: string) => {
 	let child;
 
 	if (process.platform === 'win32') {
@@ -237,7 +237,7 @@ const download = (repo: string, incoming: string, done: string, failed: string, 
 		}
 
 		try {
-			child = spawn('gh', ['skill', 'install', repo, '--all', '--dir', incoming, '--force'], { stdio: ['ignore', 'ignore', stderr], detached: true });
+			child = spawn('gh', installArguments(repo, pin, incoming), { stdio: ['ignore', 'ignore', stderr], detached: true });
 		} finally {
 			/*
 			 * The child holds its own copy from the moment it was spawned, so this one is closed either way.
@@ -252,7 +252,7 @@ const download = (repo: string, incoming: string, done: string, failed: string, 
 			}
 		}
 	} else {
-		child = spawn('sh', ['-c', installCommand(repo, incoming, done, failed, noise)], { stdio: 'ignore', detached: true });
+		child = spawn('sh', ['-c', installCommand(repo, pin, incoming, done, failed, noise)], { stdio: 'ignore', detached: true });
 	}
 
 	/*
@@ -559,7 +559,7 @@ const refresh = (configured: SkillSource, dirs: Layout, staleAfter: number, voic
 
 		claimedTarget = source.target;
 
-		const { repo, target } = source;
+		const { repo, pin, target } = source;
 		const { incoming, done, failed, pid, noise } = staging(target);
 
 		let announcement = `Refreshing ${label} from GitHub in the background.\nCarry on working — you will get a second message once it is done.`;
@@ -579,7 +579,7 @@ const refresh = (configured: SkillSource, dirs: Layout, staleAfter: number, voic
 		 */
 		notice = ctx.setTimeout(() => voice.toast(announcement, 'info'), ANNOUNCEMENT_DELAY_MS);
 
-		const install = download(repo, incoming, done, failed, pid, noise);
+		const install = download(repo, pin, incoming, done, failed, pid, noise);
 		downloadStarted = true;
 
 		log(`${label}: downloading into ${incoming}`);
@@ -779,7 +779,7 @@ const configuration = async (cwd: string, voice: Voice, log: Log): Promise<Confi
 	for (const configured of configuredSources) {
 		if (!isSource(configured)) {
 			log(`ignoring a malformed source: ${JSON.stringify(configured)}`);
-			voice.toast(`Ignoring a malformed source: ${JSON.stringify(configured)}. A source is an \`owner/repo\`, or an object with \`repo\`, optional \`target\`/\`stamp\`/\`label\` strings, \`placeholder\` as a directory name or false, and \`include\`/\`exclude\` arrays of exact skill names.`, 'error');
+			voice.toast(`Ignoring a malformed source: ${JSON.stringify(configured)}. A source is an \`owner/repo\`, or an object with \`repo\`, optional \`pin\`/\`target\`/\`stamp\`/\`label\` strings, \`placeholder\` as a directory name or false, and \`include\`/\`exclude\` arrays of exact skill names.`, 'error');
 			continue;
 		}
 

@@ -7,7 +7,7 @@ import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import * as pluginModule from './skilld.ts';
 import plugin from './skilld.ts';
-import { ABANDONED_MS, DEFAULT_INTERVAL_MS, FAILURE_COOLDOWN_MS, NOT_EXECUTABLE, NOT_FOUND, PLUGIN_NAME, asInterval, asPlaceholder, asSources, complaint, dropPlaceholder, expand, installCommand, isEmpty, isRepo, isSource, isStale, layout, linkSkills, normalize, unlink, readPluginSettings, resolveStaging, selectSkills, settleParked, slugify, staging, swap, sweepGuard } from './internals.ts';
+import { ABANDONED_MS, DEFAULT_INTERVAL_MS, FAILURE_COOLDOWN_MS, NOT_EXECUTABLE, NOT_FOUND, PLUGIN_NAME, asInterval, asPlaceholder, asSources, complaint, dropPlaceholder, expand, installArguments, installCommand, isEmpty, isRepo, isSource, isStale, layout, linkSkills, normalize, unlink, readPluginSettings, resolveStaging, selectSkills, settleParked, slugify, staging, swap, sweepGuard } from './internals.ts';
 
 const INTERVAL_MS = 24 * 60 * 60 * 1000;
 
@@ -360,7 +360,7 @@ test(
 		expect(isSource({ repo: 'anthropics/skills' }))
 			.toBe(true);
 
-		expect(isSource({ repo: 'anthropics/skills', target: '~/skills', stamp: '~/stamp', label: 'the skills', placeholder: false, include: ['frontend-design'], exclude: ['pdf'] }))
+		expect(isSource({ repo: 'anthropics/skills', pin: 'v2.3.0', target: '~/skills', stamp: '~/stamp', label: 'the skills', placeholder: false, include: ['frontend-design'], exclude: ['pdf'] }))
 			.toBe(true);
 
 		expect(isSource({ repo: 'anthropics/skills', include: [], exclude: [] }))
@@ -396,6 +396,12 @@ test(
 			.toBe(false);
 
 		expect(isSource({ repo: 'anthropics/skills', label: {} }))
+			.toBe(false);
+
+		expect(isSource({ repo: 'anthropics/skills', pin: '' }))
+			.toBe(false);
+
+		expect(isSource({ repo: 'anthropics/skills', pin: 42 }))
 			.toBe(false);
 
 		expect(isSource({ repo: 'anthropics/skills', placeholder: 123 }))
@@ -1069,6 +1075,7 @@ test(
 	() => {
 		const overridden = {
 			repo: 'someone/their-skills',
+			pin: 'v2.3.0',
 			target: '/skills',
 			stamp: '/state/stamp',
 			label: 'their skills',
@@ -1388,6 +1395,18 @@ test(
  * Runs the real wrapper with a `PATH` holding only what the case wants `gh` to be, so the markers are the shell's own doing and no `gh` installed on this machine can be reached.
  * Nothing else the command needs — `[`, `:`, the redirection — lives outside the shell, which is what makes that `PATH` enough; the shell itself is spawned by absolute path, since Node resolves the executable through the same `PATH` the case has emptied.
  */
+test(
+	'installArguments leaves an unpinned source floating',
+	() => expect(installArguments('anthropics/skills', undefined, '/incoming'))
+		.toEqual(['skill', 'install', 'anthropics/skills', '--all', '--dir', '/incoming', '--force'])
+);
+
+test(
+	'installArguments passes a source pin through to gh',
+	() => expect(installArguments('anthropics/skills', 'v2.3.0', '/incoming'))
+		.toEqual(['skill', 'install', 'anthropics/skills', '--pin', 'v2.3.0', '--all', '--dir', '/incoming', '--force'])
+);
+
 const runInstall = (name: string, gh?: { script: string; mode: number }) => {
 	const home = join(scratch, name);
 	const bin = join(home, 'bin');
@@ -1402,7 +1421,7 @@ const runInstall = (name: string, gh?: { script: string; mode: number }) => {
 		chmodSync(path, gh.mode);
 	}
 
-	const { status, error } = spawnSync('/bin/sh', ['-c', installCommand('anthropics/skills', incoming, done, failed, noise)], { env: { PATH: bin }, stdio: 'ignore' });
+	const { status, error } = spawnSync('/bin/sh', ['-c', installCommand('anthropics/skills', undefined, incoming, done, failed, noise)], { env: { PATH: bin }, stdio: 'ignore' });
 
 	if (error !== undefined) {
 		throw error;

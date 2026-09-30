@@ -59,6 +59,7 @@ omp plugin config list omp-skilld
 ```bash
 omp plugin config set omp-skilld sources 'anthropics/skills, someone/their-skills'
 omp plugin config set omp-skilld sources '[{"repo": "anthropics/skills", "target": "~/skills/anthropic"}]'
+omp plugin config set omp-skilld sources '[{"repo": "anthropics/skills", "pin": "v2.3.0"}]'
 omp plugin config set omp-skilld sources '[{"repo": "anthropics/skills", "include": ["frontend-design", "mcp-builder"]}, "obra/superpowers"]'
 omp plugin config set omp-skilld interval 604800000
 ```
@@ -124,6 +125,7 @@ A source given as an object can override what the bare `owner/repo` derives:
 | Field         | Default                                | Meaning                                                                                                 |
 |---------------|----------------------------------------|---------------------------------------------------------------------------------------------------------|
 | `repo`        | —                                      | The GitHub `"owner/repo"` to install from. Required, and refused unless it looks like one.              |
+| `pin`         | latest upstream                          | Release, ref, or commit passed to `gh skill install --pin`. Must be a non-empty string when configured. |
 | `target`      | `~/.omp/skilld/<slug>`                 | Where to install. `<slug>` is `repo` with `/` turned into `-`.                                          |
 | `stamp`       | `~/.omp/skilld/.<slug>-refreshed`      | Where the last successful refresh is recorded.                                                          |
 | `label`       | `repo`                                 | The name used in toasts.                                                                                |
@@ -141,8 +143,12 @@ Names are exact and case-sensitive.
 A missing `include` name is reported because a typo can silently publish nothing, while a missing `exclude` name is ignored so stale blacklist entries stay harmless.
 Selection only controls publication: skilld still downloads the repository once with `gh skill install --all`, so changing a selector takes effect on the next launch without another download.
 
+A source `pin` is passed straight to `gh skill install --pin`; skilld does not check out refs itself.
+Pinning changes what revision a refresh fetches, not when that refresh happens: the global `interval`, failure cooldown and in-flight detection keep their existing behavior, while `include` and `exclude` still filter only what gets published afterward.
+Changing a pin on a source that is still fresh therefore waits for its next normal refresh unless you run `/skilld refresh <repository-or-label>`.
+
 Nothing above is enforced by the settings schema, so everything is validated at runtime.
-Anything that does not match is ignored with an error toast rather than taken literally — an option with an unknown name, a `sources` that is neither a list nor JSON describing one, an entry that names no `repo` or names something that is not `owner/repo`, an entry giving `target`, `stamp` or `label` the wrong type or an empty string, an `include` or `exclude` that is not an array of exact skill names, an `interval` that is not a number.
+Anything that does not match is ignored with an error toast rather than taken literally — an option with an unknown name, a `sources` that is neither a list nor JSON describing one, an entry that names no `repo` or names something that is not `owner/repo`, an entry giving `pin`, `target`, `stamp` or `label` the wrong type or an empty string, an `include` or `exclude` that is not an array of exact skill names, an `interval` that is not a number.
 
 A `~` on its own, or a leading `~/`, is expanded in `target` and `stamp`.
 Nothing else is — not `$VAR`, not `~user` — because these go straight to `mkdirSync` and never near a shell.

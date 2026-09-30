@@ -60,6 +60,7 @@ interface SkillSelection {
 interface SkillRepository extends SkillSelection {
 	/** A GitHub `"owner/repo"` to pull skills from, e.g. `"anthropics/skills"`. */
 	repo: string;
+	pin?: string;
 	target?: string;
 	stamp?: string;
 	label?: string;
@@ -76,6 +77,7 @@ interface Options {
 
 interface NormalizedSource extends SkillSelection {
 	repo: string;
+	pin?: string;
 	target: string;
 	stamp: string;
 	label: string;
@@ -214,13 +216,13 @@ const isSource = (source: unknown): source is SkillSource => {
 		return false;
 	}
 
-	const { repo, target, stamp, label, placeholder, include, exclude } = source as { [K in keyof SkillRepository]: unknown };
+	const { repo, pin, target, stamp, label, placeholder, include, exclude } = source as { [K in keyof SkillRepository]: unknown };
 
 	if (!isRepo(repo)) {
 		return false;
 	}
 
-	if (![target, stamp, label].every(isOptionalText)) {
+	if (![pin, target, stamp, label].every(isOptionalText)) {
 		return false;
 	}
 
@@ -261,7 +263,7 @@ const normalize = (source: SkillSource, root: string): NormalizedSource => {
 	const target = resolve(expand(configured.target ?? join(root, slug)));
 	const stamp = resolve(expand(configured.stamp ?? join(root, `.${slug}-refreshed`)));
 
-	return {
+	const normalized: NormalizedSource = {
 		repo: configured.repo,
 		target,
 		stamp,
@@ -270,6 +272,12 @@ const normalize = (source: SkillSource, root: string): NormalizedSource => {
 		include: configured.include,
 		exclude: configured.exclude
 	};
+
+	if (configured.pin !== undefined) {
+		normalized.pin = configured.pin;
+	}
+
+	return normalized;
 };
 
 /** A stamp that cannot be read counts as stale: there has never been a successful refresh to go by. */
@@ -345,13 +353,25 @@ const complaint = (noise: string): string | undefined => {
 /** Single-quoted for the shell that wraps `gh`, with any quote in the text closed, escaped and reopened the way `sh` requires. */
 const q = (text: string) => `'${text.replaceAll('\'', `'\\''`)}'`;
 
+/** The argv shared by the direct Windows spawn and the POSIX shell wrapper, so source options cannot drift between platforms. */
+const installArguments = (repo: string, pin: string | undefined, incoming: string) => {
+	const args = ['skill', 'install', repo];
+	if (pin !== undefined) {
+		args.push('--pin', pin);
+	}
+
+	args.push('--all', '--dir', incoming, '--force');
+
+	return args;
+};
+
 /**
  * The download, wrapped so that something which outlives this process records how it ended: the launch that started it may well be gone before it finishes, and the next one reads the markers it left.
  * The shell's own verdicts are exempt from the failure marker — a `gh` that was never found, or never ran, spent none of the rate limit the cooldown exists to protect, so installing it and relaunching works at once instead of after an hour.
  * `gh`'s stderr is kept rather than discarded: an exit code says a download failed and only `gh` can say why, and that stream is where it says so. The redirection truncates on every attempt, so what is read back is always this download's account of itself.
  * Both markers are written with `:` and a redirection rather than `touch`, so nothing here depends on what is on `PATH` beyond `gh` itself.
  */
-const installCommand = (repo: string, incoming: string, done: string, failed: string, noise: string) => `gh skill install ${q(repo)} --all --dir ${q(incoming)} --force 2> ${q(noise)}; rc=$?; if [ "$rc" -eq 0 ]; then : > ${q(done)}; elif [ "$rc" -ne ${NOT_FOUND} ] && [ "$rc" -ne ${NOT_EXECUTABLE} ]; then : > ${q(failed)}; fi; exit "$rc"`;
+const installCommand = (repo: string, pin: string | undefined, incoming: string, done: string, failed: string, noise: string) => `gh ${installArguments(repo, pin, incoming).map(q).join(' ')} 2> ${q(noise)}; rc=$?; if [ "$rc" -eq 0 ]; then : > ${q(done)}; elif [ "$rc" -ne ${NOT_FOUND} ] && [ "$rc" -ne ${NOT_EXECUTABLE} ]; then : > ${q(failed)}; fi; exit "$rc"`;
 
 /**
  * Stands a finished download in for the live directory, so a half-written one is never what omp scans.
@@ -742,4 +762,4 @@ const readPluginSettings = async (cwd: string): Promise<{ options: Record<string
 	}
 };
 
-export { DEFAULT_INTERVAL_MS, ANNOUNCEMENT_DELAY_MS, DEFAULT_PLACEHOLDER, ABANDONED_MS, FAILURE_COOLDOWN_MS, NOT_FOUND, NOT_EXECUTABLE, PLUGIN_NAME, type SkillRepository, type SkillSource, type Options, type NormalizedSource, type StagingState, type Layout, slugify, reason, complaint, expand, asInterval, asPlaceholder, asSources, isRepo, isSource, layout, normalize, staging, installCommand, settleParked, swap, isStale, isEmpty, dropPlaceholder, installedSkills, selectSkills, claim, linkSkills, unlink, isInFlight, resolveStaging, readPluginSettings };
+export { DEFAULT_INTERVAL_MS, ANNOUNCEMENT_DELAY_MS, DEFAULT_PLACEHOLDER, ABANDONED_MS, FAILURE_COOLDOWN_MS, NOT_FOUND, NOT_EXECUTABLE, PLUGIN_NAME, type SkillRepository, type SkillSource, type Options, type NormalizedSource, type StagingState, type Layout, slugify, reason, complaint, expand, asInterval, asPlaceholder, asSources, isRepo, isSource, layout, normalize, staging, installArguments, installCommand, settleParked, swap, isStale, isEmpty, dropPlaceholder, installedSkills, selectSkills, claim, linkSkills, unlink, isInFlight, resolveStaging, readPluginSettings };
