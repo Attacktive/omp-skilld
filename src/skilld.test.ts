@@ -360,7 +360,7 @@ test(
 		expect(isSource({ repo: 'anthropics/skills' }))
 			.toBe(true);
 
-		expect(isSource({ repo: 'anthropics/skills', pin: 'v2.3.0', target: '~/skills', stamp: '~/stamp', label: 'the skills', placeholder: false, include: ['frontend-design'], exclude: ['pdf'] }))
+		expect(isSource({ repo: 'anthropics/skills', interval: false, pin: 'v2.3.0', target: '~/skills', stamp: '~/stamp', label: 'the skills', placeholder: false, include: ['frontend-design'], exclude: ['pdf'] }))
 			.toBe(true);
 
 		expect(isSource({ repo: 'anthropics/skills', include: [], exclude: [] }))
@@ -424,6 +424,15 @@ test(
 
 		expect(isSource({ repo: 'anthropics/skills', exclude: ['nested/pdf'] }))
 			.toBe(false);
+
+		expect(isSource({ repo: 'anthropics/skills', interval: -1 }))
+			.toBe(false);
+
+		expect(isSource({ repo: 'anthropics/skills', interval: 'daily' }))
+			.toBe(false);
+
+		expect(isSource({ repo: 'anthropics/skills', interval: true }))
+			.toBe(false);
 	}
 );
 
@@ -462,16 +471,65 @@ test(
 		writeFileSync(stamp, '');
 
 		const { heard, run, command } = listener();
-		await run({ sources: [{ repo: 'someone/their-skills', target, stamp, label: 'docs' }] });
+		await run({ sources: [{ repo: 'someone/their-skills', target, stamp, label: 'docs', interval: 604_800_000 }], interval: 3_600_000 });
 
 		heard.length = 0;
 		await command('');
 
 		expect(heard[heard.length - 1])
-			.toEqual({ message: 'docs: fresh · 1 published skill(s)', type: 'info' });
+			.toEqual({ message: 'docs: fresh · refresh: every 604800000 ms · 1 published skill(s)', type: 'info' });
 
 		expect(readlinkSync(published))
 			.toBe(join(target, 'command-status-skill'));
+	}
+);
+
+onPosix(
+	'a per-source interval overrides the global interval without changing another source',
+	async () => {
+		const home = join(scratch, 'source-interval');
+		const bin = join(home, 'bin');
+		const fast = downloaded('source-interval-fast', ['fast-skill']);
+		const normal = downloaded('source-interval-normal', ['normal-skill']);
+		const fastStamp = join(home, 'fast-stamp');
+		const normalStamp = join(home, 'normal-stamp');
+
+		mkdirSync(bin, { recursive: true });
+		symlinkSync('/bin/sh', join(bin, 'sh'));
+		writeFileSync(join(bin, 'gh'), '#!/bin/sh\nexit 1\n');
+		chmodSync(join(bin, 'gh'), 0o755);
+		writeFileSync(fastStamp, '');
+		writeFileSync(normalStamp, '');
+
+		const old = new Date(Date.now() - 1000);
+
+		utimesSync(fastStamp, old, old);
+		utimesSync(normalStamp, old, old);
+
+		const previousPath = process.env.PATH;
+		process.env.PATH = bin;
+
+		const { board, run, settleDownload } = listener();
+
+		try {
+			await run({
+				sources: [
+					{ repo: 'owner/fast', target: fast.target, stamp: fastStamp, label: 'fast', interval: 0 },
+					{ repo: 'owner/normal', target: normal.target, stamp: normalStamp, label: 'normal' }
+				],
+				interval: INTERVAL_MS
+			});
+
+			await settleDownload(() => existsSync(staging(fast.target).failed));
+		} finally {
+			process.env.PATH = previousPath;
+		}
+
+		expect(board.widgets[`${PLUGIN_NAME}:fast`])
+			.toBeDefined();
+
+		expect(board.widgets[`${PLUGIN_NAME}:normal`])
+			.toBeUndefined();
 	}
 );
 
@@ -518,6 +576,51 @@ test(
 
 		expect(heard[heard.length - 1]?.message)
 			.toContain('abandoned: abandoned download');
+	}
+);
+
+onPosix(
+	'a manual-only source skips automatic downloads but still accepts /skilld refresh',
+	async () => {
+		const home = join(scratch, 'manual-only');
+		const bin = join(home, 'bin');
+		const { target } = downloaded('manual-only-source', ['manual-skill']);
+		const stamp = join(home, 'stamp');
+
+		mkdirSync(bin, { recursive: true });
+		symlinkSync('/bin/sh', join(bin, 'sh'));
+		writeFileSync(join(bin, 'gh'), '#!/bin/sh\nexit 1\n');
+		chmodSync(join(bin, 'gh'), 0o755);
+
+		const previousPath = process.env.PATH;
+		process.env.PATH = bin;
+
+		const { heard, board, run, command, settleDownload } = listener();
+
+		try {
+			await run({ sources: [{ repo: 'owner/manual', target, stamp, label: 'manual', interval: false }] });
+
+			expect(board.widgets[`${PLUGIN_NAME}:manual`])
+				.toBeUndefined();
+
+			heard.length = 0;
+			await command('status');
+
+			expect(heard[heard.length - 1]?.message)
+				.toContain('manual: never refreshed · refresh: manual only');
+
+			heard.length = 0;
+			await command('refresh manual');
+			await settleDownload(() => existsSync(staging(target).failed));
+		} finally {
+			process.env.PATH = previousPath;
+		}
+
+		expect(board.widgets[`${PLUGIN_NAME}:manual`])
+			.toBeDefined();
+
+		expect(heard.some((toast) => toast.type === 'info' && toast.message.includes('Requesting a refresh for manual')))
+			.toBe(true);
 	}
 );
 
@@ -1075,6 +1178,7 @@ test(
 	() => {
 		const overridden = {
 			repo: 'someone/their-skills',
+			interval: false,
 			pin: 'v2.3.0',
 			target: '/skills',
 			stamp: '/state/stamp',
@@ -1251,6 +1355,22 @@ test(
 			.toBe('finish');
 
 		// Left for the caller to install: deciding is not the same as swapping.
+		expect(existsSync(incoming))
+			.toBe(true);
+	}
+);
+
+test(
+	'resolveStaging installs a completed download for a manual-only source even when the old stamp is fresh',
+	() => {
+		const { target, incoming } = staged('resolve-done-manual', 'done');
+		const stamp = join(scratch, 'resolve-done-manual-stamp');
+
+		writeFileSync(stamp, '');
+
+		expect(resolveStaging(target, stamp, false))
+			.toBe('finish');
+
 		expect(existsSync(incoming))
 			.toBe(true);
 	}

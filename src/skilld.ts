@@ -471,7 +471,7 @@ const restoreStampBeforeDownload = (snapshot: StampSnapshot | undefined, downloa
 };
 
 /** Settles old staging, republishes the current target, and decides whether this request has earned a new download. */
-const prepareRefresh = (source: NormalizedSource, dirs: Layout, staleAfter: number, voice: Voice, log: Log, force: boolean) => {
+const prepareRefresh = (source: NormalizedSource, dirs: Layout, staleAfter: number | false, voice: Voice, log: Log, force: boolean) => {
 	const { target, stamp } = source;
 
 	/*
@@ -508,6 +508,11 @@ const prepareRefresh = (source: NormalizedSource, dirs: Layout, staleAfter: numb
 		return true;
 	}
 
+	if (staleAfter === false) {
+		log(`${source.label}: automatic refresh disabled; nothing to do`);
+		return false;
+	}
+
 	if (!isStale(stamp, staleAfter)) {
 		log(`${source.label}: refreshed within the last ${staleAfter} ms; nothing to do`);
 		return false;
@@ -517,7 +522,7 @@ const prepareRefresh = (source: NormalizedSource, dirs: Layout, staleAfter: numb
 };
 
 /** Claims one normalized source, releasing the claim immediately when staging or freshness says there is no download to start. */
-const prepareConfiguredRefresh = (source: NormalizedSource, dirs: Layout, staleAfter: number, voice: Voice, log: Log, force: boolean) => {
+const prepareConfiguredRefresh = (source: NormalizedSource, dirs: Layout, staleAfter: number | false, voice: Voice, log: Log, force: boolean) => {
 	if (!claimRefreshTarget(source, log)) {
 		return undefined;
 	}
@@ -536,7 +541,7 @@ const prepareConfiguredRefresh = (source: NormalizedSource, dirs: Layout, staleA
 };
 
 /** Fires one source's refresh off in the background and never waits on it. */
-const refresh = (configured: SkillSource, dirs: Layout, staleAfter: number, voice: Voice, log: Log, ctx: ExtensionContext, force = false) => {
+const refresh = (configured: SkillSource, dirs: Layout, defaultStaleAfter: number, voice: Voice, log: Log, ctx: ExtensionContext, force = false) => {
 	// The catch at the bottom needs a name for the source no matter how little of the body ran.
 	let label = JSON.stringify(configured);
 	let voiceId = label;
@@ -552,7 +557,7 @@ const refresh = (configured: SkillSource, dirs: Layout, staleAfter: number, voic
 		voiceId = normalized.target;
 		previousStamp = snapshotStamp(normalized.stamp, force);
 
-		const source = prepareConfiguredRefresh(normalized, dirs, staleAfter, voice, log, force);
+		const source = prepareConfiguredRefresh(normalized, dirs, normalized.interval ?? defaultStaleAfter, voice, log, force);
 		if (source === undefined) {
 			return;
 		}
@@ -779,7 +784,7 @@ const configuration = async (cwd: string, voice: Voice, log: Log): Promise<Confi
 	for (const configured of configuredSources) {
 		if (!isSource(configured)) {
 			log(`ignoring a malformed source: ${JSON.stringify(configured)}`);
-			voice.toast(`Ignoring a malformed source: ${JSON.stringify(configured)}. A source is an \`owner/repo\`, or an object with \`repo\`, optional \`pin\`/\`target\`/\`stamp\`/\`label\` strings, \`placeholder\` as a directory name or false, and \`include\`/\`exclude\` arrays of exact skill names.`, 'error');
+			voice.toast(`Ignoring a malformed source: ${JSON.stringify(configured)}. A source is an \`owner/repo\`, or an object with \`repo\`, optional \`interval\` as non-negative milliseconds or false, \`pin\`/\`target\`/\`stamp\`/\`label\` strings, \`placeholder\` as a directory name or false, and \`include\`/\`exclude\` arrays of exact skill names.`, 'error');
 			continue;
 		}
 
@@ -810,7 +815,7 @@ const failedSourceStatus = (noise: string) => {
 	return `last refresh failed · ${detail}`;
 };
 
-const sourceStatus = (source: NormalizedSource, staleAfter: number) => {
+const sourceStatus = (source: NormalizedSource, staleAfter: number | false) => {
 	const { incoming, done, failed, pid, noise } = staging(source.target);
 
 	if (refreshingTargets.has(source.target)) {
@@ -837,11 +842,23 @@ const sourceStatus = (source: NormalizedSource, staleAfter: number) => {
 		return 'never refreshed';
 	}
 
+	if (staleAfter === false) {
+		return 'fresh';
+	}
+
 	if (isStale(source.stamp, staleAfter)) {
 		return 'stale';
 	}
 
 	return 'fresh';
+};
+
+const refreshPolicyStatus = (staleAfter: number | false) => {
+	if (staleAfter === false) {
+		return 'refresh: manual only';
+	}
+
+	return `refresh: every ${staleAfter} ms`;
 };
 
 const showStatus = async (agentDir: string, cwd: string, voice: Voice, log: Log) => {
@@ -858,7 +875,11 @@ const showStatus = async (agentDir: string, cwd: string, voice: Voice, log: Log)
 	const dirs = layout(agentDir);
 	const lines = configured.sources
 		.map((source) => normalize(source, dirs.root))
-		.map((source) => `${source.label}: ${sourceStatus(source, configured.staleAfter)} · ${publishedSkillCount(source, dirs)} published skill(s)`);
+		.map((source) => {
+			const staleAfter = source.interval ?? configured.staleAfter;
+
+			return `${source.label}: ${sourceStatus(source, staleAfter)} · ${refreshPolicyStatus(staleAfter)} · ${publishedSkillCount(source, dirs)} published skill(s)`;
+		});
 
 	voice.toast(lines.join('\n'), 'info');
 };

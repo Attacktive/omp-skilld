@@ -60,6 +60,7 @@ interface SkillSelection {
 interface SkillRepository extends SkillSelection {
 	/** A GitHub `"owner/repo"` to pull skills from, e.g. `"anthropics/skills"`. */
 	repo: string;
+	interval?: number | false;
 	pin?: string;
 	target?: string;
 	stamp?: string;
@@ -77,6 +78,7 @@ interface Options {
 
 interface NormalizedSource extends SkillSelection {
 	repo: string;
+	interval?: number | false;
 	pin?: string;
 	target: string;
 	stamp: string;
@@ -135,6 +137,8 @@ const isOptionalText = (value: unknown) => value === undefined || isText(value);
 const isObject = (value: unknown): value is object => typeof value === 'object' && value !== null;
 
 const isOptionalPlaceholder = (value: unknown) => value === undefined || typeof value === 'string' || value === false;
+
+const isOptionalRefreshPolicy = (value: unknown) => value === undefined || value === false || (typeof value === 'number' && Number.isFinite(value) && value >= 0);
 
 /** Selector names are matched directly against directory names from `readdirSync`, so paths and dot-segments can never match and are rejected at the configuration boundary. */
 const isOptionalSkillList = (value: unknown) => value === undefined || (Array.isArray(value) && value.every(isDirectoryName));
@@ -216,7 +220,7 @@ const isSource = (source: unknown): source is SkillSource => {
 		return false;
 	}
 
-	const { repo, pin, target, stamp, label, placeholder, include, exclude } = source as { [K in keyof SkillRepository]: unknown };
+	const { repo, interval, pin, target, stamp, label, placeholder, include, exclude } = source as { [K in keyof SkillRepository]: unknown };
 
 	if (!isRepo(repo)) {
 		return false;
@@ -227,6 +231,10 @@ const isSource = (source: unknown): source is SkillSource => {
 	}
 
 	if (![include, exclude].every(isOptionalSkillList)) {
+		return false;
+	}
+
+	if (!isOptionalRefreshPolicy(interval)) {
 		return false;
 	}
 
@@ -272,6 +280,10 @@ const normalize = (source: SkillSource, root: string): NormalizedSource => {
 		include: configured.include,
 		exclude: configured.exclude
 	};
+
+	if (configured.interval !== undefined) {
+		normalized.interval = configured.interval;
+	}
 
 	if (configured.pin !== undefined) {
 		normalized.pin = configured.pin;
@@ -690,12 +702,12 @@ type StagingState = 'finish' | 'failed' | 'cooling' | 'in-flight' | 'skip';
  * What the staging area left by an earlier launch says: a finished download to stand in, a failed one to sweep, one still running to leave alone, or nothing to go on.
  * The markers are what a launch that quit before its download did leaves behind, so the next one can finish the job instead of paying for the download again.
  */
-const resolveStaging = (target: string, stamp: string, staleAfter: number): StagingState => {
+const resolveStaging = (target: string, stamp: string, staleAfter: number | false): StagingState => {
 	const { incoming, done, failed, pid } = staging(target);
 
 	if (existsSync(done)) {
 		// Standing a finished download in beats downloading it again; a stamp that is still fresh makes the marker moot, since the refresh it records already happened.
-		if (isStale(stamp, staleAfter)) {
+		if (staleAfter === false || isStale(stamp, staleAfter)) {
 			return 'finish';
 		}
 
