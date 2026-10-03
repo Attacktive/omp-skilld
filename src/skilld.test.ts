@@ -1178,7 +1178,7 @@ test(
 	() => {
 		const overridden = {
 			repo: 'someone/their-skills',
-			interval: false,
+			interval: 604_800_000,
 			pin: 'v2.3.0',
 			target: '/skills',
 			stamp: '/state/stamp',
@@ -1193,6 +1193,11 @@ test(
 	}
 );
 
+test(
+	'normalize keeps `interval: false` rather than replacing it with the global policy',
+	() => expect(normalize({ repo: 'someone/their-skills', interval: false }, '/omp/skilld').interval)
+		.toBe(false)
+);
 test(
 	'normalize keeps `placeholder: false` rather than defaulting it, so nothing is deleted',
 	() => expect(normalize({ repo: 'someone/their-skills', placeholder: false }, '/omp/skilld').placeholder)
