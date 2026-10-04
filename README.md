@@ -60,6 +60,7 @@ omp plugin config list omp-skilld
 omp plugin config set omp-skilld sources 'anthropics/skills, someone/their-skills'
 omp plugin config set omp-skilld sources '[{"repo": "anthropics/skills", "target": "~/skills/anthropic"}]'
 omp plugin config set omp-skilld sources '[{"repo": "anthropics/skills", "pin": "v2.3.0"}]'
+omp plugin config set omp-skilld sources '[{"repo": "anthropics/skills", "interval": 604800000}, {"repo": "obra/superpowers", "interval": false}]'
 omp plugin config set omp-skilld sources '[{"repo": "anthropics/skills", "include": ["frontend-design", "mcp-builder"]}, "obra/superpowers"]'
 omp plugin config set omp-skilld interval 604800000
 ```
@@ -106,7 +107,7 @@ Skilld registers a small control surface inside OMP:
 /skilld refresh anthropics/skills
 ```
 
-`/skilld` and `/skilld status` report each configured source as fresh, stale, refreshing, waiting to install, failed, or never refreshed, together with how many of that source's skills are actually published into OMP's skills directory.
+`/skilld` and `/skilld status` report each configured source as fresh, stale, refreshing, waiting to install, failed, or never refreshed, together with its effective refresh policy and how many of that source's skills are actually published into OMP's skills directory.
 A retained download complaint is shown beside a failed source when `gh` left one.
 
 `/skilld refresh` forces every configured source past the normal freshness interval, and `/skilld refresh <repository-or-label>` targets one source by its exact repository or configured label.
@@ -118,13 +119,14 @@ The refresh remains fire-and-forget: the command returns immediately, the usual 
 | Option     | Default           | Meaning                                                                                                        |
 |------------|-------------------|----------------------------------------------------------------------------------------------------------------|
 | `sources`  | `[]`              | Repositories to refresh from: a list of `owner/repo`, or JSON for the object form below.                       |
-| `interval` | `86400000` (24 h) | How long a refresh stays fresh, in milliseconds. `0` refreshes every launch, which the rate limit will notice. |
+| `interval` | `86400000` (24 h) | Default time a refresh stays fresh, in milliseconds. `0` refreshes every launch, which the rate limit will notice. |
 
 A source given as an object can override what the bare `owner/repo` derives:
 
 | Field         | Default                                | Meaning                                                                                                 |
 |---------------|----------------------------------------|---------------------------------------------------------------------------------------------------------|
 | `repo`        | —                                      | The GitHub `"owner/repo"` to install from. Required, and refused unless it looks like one.              |
+| `interval`    | global `interval`                      | Refresh interval for this source in milliseconds, or `false` for manual-only refreshes.                 |
 | `pin`         | latest upstream                          | Release, ref, or commit passed to `gh skill install --pin`. Must be a non-empty string when configured. |
 | `target`      | `~/.omp/skilld/<slug>`                 | Where to install. `<slug>` is `repo` with `/` turned into `-`.                                          |
 | `stamp`       | `~/.omp/skilld/.<slug>-refreshed`      | Where the last successful refresh is recorded.                                                          |
@@ -144,11 +146,12 @@ A missing `include` name is reported because a typo can silently publish nothing
 Selection only controls publication: skilld still downloads the repository once with `gh skill install --all`, so changing a selector takes effect on the next launch without another download.
 
 A source `pin` is passed straight to `gh skill install --pin`; skilld does not check out refs itself.
-Pinning changes what revision a refresh fetches, not when that refresh happens: the global `interval`, failure cooldown and in-flight detection keep their existing behavior, while `include` and `exclude` still filter only what gets published afterward.
+Pinning changes what revision a refresh fetches, not when that refresh happens: the source's `interval`, or the global `interval` when it has no override, decides normal freshness while failure cooldown and in-flight detection remain independent safeguards.
+Set a source's `interval` to `false` to make it manual-only; `/skilld refresh <repository-or-label>` still refreshes it on demand.
 Changing a pin on a source that is still fresh therefore waits for its next normal refresh unless you run `/skilld refresh <repository-or-label>`.
 
 Nothing above is enforced by the settings schema, so everything is validated at runtime.
-Anything that does not match is ignored with an error toast rather than taken literally — an option with an unknown name, a `sources` that is neither a list nor JSON describing one, an entry that names no `repo` or names something that is not `owner/repo`, an entry giving `pin`, `target`, `stamp` or `label` the wrong type or an empty string, an `include` or `exclude` that is not an array of exact skill names, an `interval` that is not a number.
+Anything that does not match is ignored with an error toast rather than taken literally — an option with an unknown name, a `sources` that is neither a list nor JSON describing one, an entry that names no `repo` or names something that is not `owner/repo`, an entry giving `interval` something other than non-negative milliseconds or `false`, `pin`, `target`, `stamp` or `label` the wrong type or an empty string, an `include` or `exclude` that is not an array of exact skill names, or a global `interval` that is not a number.
 
 A `~` on its own, or a leading `~/`, is expanded in `target` and `stamp`.
 Nothing else is — not `$VAR`, not `~user` — because these go straight to `mkdirSync` and never near a shell.
@@ -188,7 +191,7 @@ A flat list of directories, and not too many. A repository that files skills by 
 
 ## Behaviour
 
-- Refreshes at most once per `interval` per source, tracked by a stamp file that is written **after** a refresh succeeds — so an interrupted one simply retries next launch.
+- Refreshes each source at most once per its effective `interval`: the source override when present, otherwise the global default. The stamp file is written **after** a refresh succeeds, so an interrupted one simply retries next launch. A source with `interval: false` never starts an automatic download, but finished staging work is still settled and manual refresh remains available.
 - Downloads into a hidden staging directory beside `target` and stands it in for the live one only once `gh` has succeeded, so OMP never scans a half-written skill set. Beside it rather than under `TMPDIR` because a rename across filesystems fails, and hidden so a scan cannot mistake it for a skill. Nothing appears at `target` until a refresh has actually succeeded. Not a single atomic step — nothing Node exposes can exchange two directories — but the live directory is absent for two renames rather than for the length of a download, and a swap that fails puts the previous skills back rather than leaving a gap. A launch killed *between* those two renames leaves the previous skills parked beside the target, and the next launch stands them back in rather than sweeping them.
 - A finished download that could not be installed — the target's parent unwritable, say — keeps its claim, so the next launch retries the install rather than paying for the download again.
 - Never awaited, and the download is detached, so quitting OMP never waits on one — and never kills one either. A download that outlives its launch records how it ended beside the staging directory; the next launch installs a finished one instead of downloading it again. Two launches that find the same finished download cannot both install it: claiming it is a single unlink, and the one that loses it stands aside.
