@@ -1,4 +1,5 @@
 import { Buffer } from 'node:buffer';
+import { writeFileSync } from 'node:fs';
 
 interface SourceWithSkills {
 	skills?: unknown;
@@ -62,6 +63,18 @@ const registerSkillTarget = (target: string, targets: Set<string>, names: Map<st
 	return undefined;
 };
 
+const skillTargetError = (target: unknown): string | undefined => {
+	if (typeof target === 'string' && target.includes('@')) {
+		return `\`skills\` target ${JSON.stringify(target)} must not use an inline @version; configure the source \`pin\` instead`;
+	}
+
+	if (!isSkillTarget(target)) {
+		return `\`skills\` contains a malformed target: ${JSON.stringify(target)}`;
+	}
+
+	return undefined;
+};
+
 /** Explains only the optional `skills` field; the rest of a source is validated by `isSource`. */
 const skillTargetsError = (source: unknown): string | undefined => {
 	const configured = sourceWithSkills(source);
@@ -77,8 +90,9 @@ const skillTargetsError = (source: unknown): string | undefined => {
 	const names = new Map<string, string>();
 
 	for (const target of configured.skills) {
-		if (!isSkillTarget(target)) {
-			return `\`skills\` contains a malformed target: ${JSON.stringify(target)}`;
+		const targetError = skillTargetError(target);
+		if (targetError !== undefined) {
+			return targetError;
 		}
 
 		const registrationError = registerSkillTarget(target, targets, names);
@@ -102,12 +116,12 @@ const configuredSkillTargets = (source: unknown): string[] | undefined => {
 
 /** The direct argv for one selected target. Absence of `skills` keeps using internals' existing `--all` argv instead. */
 const selectedInstallArguments = (repo: string, pin: string | undefined, target: string, incoming: string) => {
-	const args = ['skill', 'install', repo, target];
+	const args = ['skill', 'install', repo];
 	if (pin !== undefined) {
 		args.push('--pin', pin);
 	}
 
-	args.push('--dir', incoming, '--force');
+	args.push('--dir', incoming, '--force', '--', target);
 
 	return args;
 };
@@ -131,11 +145,8 @@ const powerShellInvocation = (args: string[], failed: string) => {
 	const literals = args.map(psq).join(', ');
 
 	return [
-		'try {',
-		`\tif ($captureNoise) { & gh @(${literals}) 2>> $noise } else { & gh @(${literals}) 2>$null }`,
-		'} catch [System.Management.Automation.CommandNotFoundException] {',
-		'\texit 127',
-		'}',
+		`$arguments = @(${literals})`,
+		'if ($captureNoise) { & gh @arguments 2>> $noise } else { & gh @arguments 2>$null }',
 		'$rc = $LASTEXITCODE',
 		'if ($rc -ne 0) {',
 		`\tif ($rc -ne 127 -and $rc -ne 126) { try { [System.IO.File]::WriteAllText(${psq(failed)}, '') } catch {} }`,
@@ -146,15 +157,18 @@ const powerShellInvocation = (args: string[], failed: string) => {
 
 /**
  * Windows cannot rely on a POSIX shell, and a parent-side loop would die before starting later targets if OMP quit mid-refresh.
- * A detached PowerShell wrapper therefore owns the whole sequence and completion markers just like `sh` does elsewhere.
+ * A detached PowerShell script therefore owns the whole sequence and completion markers just like `sh` does elsewhere; putting it on disk keeps a large target list off CreateProcessW's command-line limit.
  */
 const selectedInstallPowerShellArguments = (repo: string, pin: string | undefined, skills: string[], incoming: string, done: string, failed: string, noise: string) => {
+	const scriptPath = `${noise}.ps1`;
 	const commands = skills
 		.map((skill) => powerShellInvocation(selectedInstallArguments(repo, pin, skill, incoming), failed))
 		.join('\n');
 
 	const script = [
-		"$ErrorActionPreference = 'Stop'",
+		"$ErrorActionPreference = 'Continue'",
+		`try { Remove-Item -LiteralPath ${psq(scriptPath)} -Force -ErrorAction SilentlyContinue } catch {}`,
+		'if ($null -eq (Get-Command gh -ErrorAction SilentlyContinue)) { exit 127 }',
 		`$noise = ${psq(noise)}`,
 		'$captureNoise = $true',
 		'try { [System.IO.File]::WriteAllText($noise, \'\') } catch { $captureNoise = $false }',
@@ -162,10 +176,11 @@ const selectedInstallPowerShellArguments = (repo: string, pin: string | undefine
 		`try { [System.IO.File]::WriteAllText(${psq(done)}, '') } catch {}`,
 		'exit 0'
 	].join('\n');
+	const encodedScript = Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(script, 'utf16le')]);
 
-	const encoded = Buffer.from(script, 'utf16le').toString('base64');
+	writeFileSync(scriptPath, encodedScript);
 
-	return ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded];
+	return ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', scriptPath];
 };
 
 export { configuredSkillTargets, selectedInstallArguments, selectedInstallCommand, selectedInstallPowerShellArguments, skillTargetsError };
