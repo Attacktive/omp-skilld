@@ -61,6 +61,7 @@ omp plugin config set omp-skilld sources 'anthropics/skills, someone/their-skill
 omp plugin config set omp-skilld sources '[{"repo": "anthropics/skills", "target": "~/skills/anthropic"}]'
 omp plugin config set omp-skilld sources '[{"repo": "anthropics/skills", "pin": "v2.3.0"}]'
 omp plugin config set omp-skilld sources '[{"repo": "anthropics/skills", "interval": 604800000}, {"repo": "obra/superpowers", "interval": false}]'
+omp plugin config set omp-skilld sources '[{"repo": "anthropics/skills", "skills": ["frontend-design", "skills/engineering/reviewer"]}]'
 omp plugin config set omp-skilld sources '[{"repo": "anthropics/skills", "include": ["frontend-design", "mcp-builder"]}, "obra/superpowers"]'
 omp plugin config set omp-skilld interval 604800000
 ```
@@ -123,27 +124,33 @@ The refresh remains fire-and-forget: the command returns immediately, the usual 
 
 A source given as an object can override what the bare `owner/repo` derives:
 
-| Field         | Default                                | Meaning                                                                                                 |
-|---------------|----------------------------------------|---------------------------------------------------------------------------------------------------------|
-| `repo`        | —                                      | The GitHub `"owner/repo"` to install from. Required, and refused unless it looks like one.              |
-| `interval`    | global `interval`                      | Refresh interval for this source in milliseconds, or `false` for manual-only refreshes.                 |
-| `pin`         | latest upstream                          | Release, ref, or commit passed to `gh skill install --pin`. Must be a non-empty string when configured. |
-| `target`      | `~/.omp/skilld/<slug>`                 | Where to install. `<slug>` is `repo` with `/` turned into `-`.                                          |
-| `stamp`       | `~/.omp/skilld/.<slug>-refreshed`      | Where the last successful refresh is recorded.                                                          |
-| `label`       | `repo`                                 | The name used in toasts.                                                                                |
-| `placeholder` | `"template"`                           | The placeholder skill directory to drop from each download, or `false` to keep whatever upstream ships. |
-| `include`     | all skills                             | Exact skill names to publish. An empty list publishes none.                                             |
-| `exclude`     | `[]`                                   | Exact skill names not to publish. Applied after `include`, so exclusion wins when both name a skill.    |
+| Field         | Default                                | Meaning                                                                                                              |
+|---------------|----------------------------------------|----------------------------------------------------------------------------------------------------------------------|
+| `repo`        | —                                      | The GitHub `"owner/repo"` to install from. Required, and refused unless it looks like one.                           |
+| `interval`    | global `interval`                      | Refresh interval for this source in milliseconds, or `false` for manual-only refreshes.                              |
+| `pin`         | latest upstream                        | Release, ref, or commit passed to `gh skill install --pin`. Must be a non-empty string when configured.              |
+| `skills`      | all skills                             | Exact skill names or repository-relative skill paths to install. When absent, skilld keeps using `--all`.            |
+| `target`      | `~/.omp/skilld/<slug>`                 | Where to install. `<slug>` is `repo` with `/` turned into `-`.                                                       |
+| `stamp`       | `~/.omp/skilld/.<slug>-refreshed`      | Where the last successful refresh is recorded.                                                                       |
+| `label`       | `repo`                                 | The name used in toasts.                                                                                             |
+| `placeholder` | `"template"`                           | The placeholder skill directory to drop from each download, or `false` to keep whatever upstream ships.              |
+| `include`     | all downloaded skills                  | Exact skill names to publish. An empty list publishes none.                                                          |
+| `exclude`     | `[]`                                   | Exact skill names not to publish. Applied after `include`, so exclusion wins when both name a skill.                 |
 
 The wholesale replacement a refresh performs is why `target` must not share a directory with anything else.
 Pointing it at a directory OMP scans — `~/.omp/agent/skills`, say — looks like it would save a symlink, but the next refresh would stand one repository's download in for the *entire* directory: another source's skills, the ones you wrote by hand, all gone with it.
 Give every source a directory of its own, and let publication be what puts skills where OMP looks.
 
-`include` chooses the candidate skills and `exclude` removes from that set.
+`skills` controls what skilld asks `gh` to download.
+Each entry is handed to `gh skill install` as an exact skill name or repository-relative path, so a nested target such as `skills/engineering/reviewer` is installed flat as `reviewer` under the source target just as `gh` installs it itself.
+Targets must be non-empty relative paths with no dot-segments; duplicate targets and different targets that would both install to the same directory name are refused before a refresh starts.
+With no `skills`, the existing `gh skill install --all` behaviour is unchanged.
+
+`include` chooses the candidate downloaded skills and `exclude` removes from that set.
 With neither configured, every downloaded skill is published; with both configured, a name in `exclude` always wins.
 Names are exact and case-sensitive.
 A missing `include` name is reported because a typo can silently publish nothing, while a missing `exclude` name is ignored so stale blacklist entries stay harmless.
-Selection only controls publication: skilld still downloads the repository once with `gh skill install --all`, so changing a selector takes effect on the next launch without another download.
+Changing `include` or `exclude` takes effect on the next launch without another download because those fields control publication only; changing `skills` changes the next refresh itself, so use `/skilld refresh <repository-or-label>` if the source is still fresh.
 
 A source `pin` is passed straight to `gh skill install --pin`; skilld does not check out refs itself.
 Pinning changes what revision a refresh fetches, not when that refresh happens: the source's `interval`, or the global `interval` when it has no override, decides normal freshness while failure cooldown and in-flight detection remain independent safeguards.
@@ -151,7 +158,7 @@ Set a source's `interval` to `false` to make it manual-only; `/skilld refresh <r
 Changing a pin on a source that is still fresh therefore waits for its next normal refresh unless you run `/skilld refresh <repository-or-label>`.
 
 Nothing above is enforced by the settings schema, so everything is validated at runtime.
-Anything that does not match is ignored with an error toast rather than taken literally — an option with an unknown name, a `sources` that is neither a list nor JSON describing one, an entry that names no `repo` or names something that is not `owner/repo`, an entry giving `interval` something other than non-negative milliseconds or `false`, `pin`, `target`, `stamp` or `label` the wrong type or an empty string, an `include` or `exclude` that is not an array of exact skill names, or a global `interval` that is not a number.
+Anything that does not match is ignored with an error toast rather than taken literally — an option with an unknown name, a `sources` that is neither a list nor JSON describing one, an entry that names no `repo` or names something that is not `owner/repo`, an entry giving `interval` something other than non-negative milliseconds or `false`, `pin`, `target`, `stamp` or `label` the wrong type or an empty string, `skills` something other than a non-empty array of unique exact skill targets, an `include` or `exclude` that is not an array of exact skill names, or a global `interval` that is not a number.
 
 A `~` on its own, or a leading `~/`, is expanded in `target` and `stamp`.
 Nothing else is — not `$VAR`, not `~user` — because these go straight to `mkdirSync` and never near a shell.
@@ -181,18 +188,19 @@ That searches skills, though, and `sources` takes repositories. Topic search fin
 gh api "search/repositories?q=topic:agent-skills&sort=stars&per_page=20" --jq '.items[] | "★\(.stargazers_count)\t\(.full_name)"'
 ```
 
-Then check the layout before adding one, because skilld still downloads each source with `--all` even when `include` or `exclude` narrows what gets published:
+Then inspect the repository before deciding whether to take everything or select exact targets:
 
 ```bash
 gh api repos/<owner>/<repo>/contents/skills --jq '.[] | .type + " " + .name'
 ```
 
-A flat list of directories, and not too many. A repository that files skills by category — `skills/engineering/<name>/SKILL.md` — sits a level deeper than OMP looks, so the refresh succeeds and nothing loads.
+A small flat collection can stay on the default `--all` path.
+For a large repository, or one that files skills below nested directories such as `skills/engineering/<name>/SKILL.md`, configure only the names or repository-relative paths you want in `skills`; skilld passes each target straight to `gh skill install` and publishes the resulting flat skill directory normally.
 
 ## Behaviour
 
 - Refreshes each source at most once per its effective `interval`: the source override when present, otherwise the global default. The stamp file is written **after** a refresh succeeds, so an interrupted one simply retries next launch. A source with `interval: false` never starts an automatic download, but finished staging work is still settled and manual refresh remains available.
-- Downloads into a hidden staging directory beside `target` and stands it in for the live one only once `gh` has succeeded, so OMP never scans a half-written skill set. Beside it rather than under `TMPDIR` because a rename across filesystems fails, and hidden so a scan cannot mistake it for a skill. Nothing appears at `target` until a refresh has actually succeeded. Not a single atomic step — nothing Node exposes can exchange two directories — but the live directory is absent for two renames rather than for the length of a download, and a swap that fails puts the previous skills back rather than leaving a gap. A launch killed *between* those two renames leaves the previous skills parked beside the target, and the next launch stands them back in rather than sweeping them.
+- Downloads into a hidden staging directory beside `target` and stands it in for the live one only once every configured install target has succeeded, so OMP never scans a half-written skill set. Beside it rather than under `TMPDIR` because a rename across filesystems fails, and hidden so a scan cannot mistake it for a skill. Nothing appears at `target` until a refresh has actually succeeded. Not a single atomic step — nothing Node exposes can exchange two directories — but the live directory is absent for two renames rather than for the length of a download, and a swap that fails puts the previous skills back rather than leaving a gap. A launch killed *between* those two renames leaves the previous skills parked beside the target, and the next launch stands them back in rather than sweeping them.
 - A finished download that could not be installed — the target's parent unwritable, say — keeps its claim, so the next launch retries the install rather than paying for the download again.
 - Never awaited, and the download is detached, so quitting OMP never waits on one — and never kills one either. A download that outlives its launch records how it ended beside the staging directory; the next launch installs a finished one instead of downloading it again. Two launches that find the same finished download cannot both install it: claiming it is a single unlink, and the one that loses it stands aside.
 - A download still running is left alone, however short the interval. Each download records its process id beside its staging directory, so a launch asks the process itself: alive means left alone however quiet the directory, gone means swept at once — a reboot mid-download, say. Only a download with no pid to ask falls back to the clock: one whose staging area has seen no new file anywhere in fifteen minutes is taken for dead and swept, so the next attempt starts clean.
@@ -208,10 +216,12 @@ A flat list of directories, and not too many. A repository that files skills by 
 
 ## Windows
 
-Children are not reaped with their parent there, so `gh` is spawned directly rather than through a shell: neither Git Bash nor WSL is involved.
-The completion and failure markers are written by the plugin's own exit handler instead, so a download that ends while OMP is still running is recorded exactly as everywhere else — the failure cooldown included, which is what keeps an expired login from costing an attempt per launch.
-The trade is that a download outliving its launch is not recorded, so it costs one redundant download rather than being installed by the next launch — the behaviour every platform had before the markers.
-A `gh` installed as a `.cmd` shim cannot be spawned this way; that surfaces as a "could not refresh" error toast, and installing the real executable (winget, scoop, the MSI) is the fix.
+An ordinary source with no `skills` configured keeps the direct `gh skill install --all` path on Windows, so neither Git Bash nor WSL is involved.
+A source with exact `skills` targets uses one detached PowerShell wrapper to run those `gh skill install` calls sequentially; the wrapper writes the same completion and failure markers as the POSIX shell wrapper, so the whole selected refresh can outlive OMP and still be picked up by the next launch.
+
+For the direct `--all` path, completion and failure markers are written by the plugin's own exit handler while OMP is alive.
+If that direct child outlives its launch, its result is not recorded and the next launch pays for one redundant download rather than installing it; selected `skills` refreshes do not have that limitation.
+A `gh` installed only as a `.cmd` shim cannot be spawned by the direct `--all` path; that surfaces as a "could not refresh" error toast, and installing the real executable (winget, scoop, the MSI) is the fix.
 
 `~` in `target` and `stamp` resolves through `os.homedir()`, which reads `USERPROFILE`.
 Keep the forward slash after the tilde: `~\.local\share\...` is not expanded.

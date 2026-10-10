@@ -4,7 +4,7 @@
  * Whatever is downloaded is picked up on the next launch instead; a pin under the editor and a pair of toasts cover the wait, because a first launch that quietly comes up with no skills looks broken.
  * Nothing here is allowed to throw — a missing `gh` or an expired login degrades to an error toast and a pin saying why, never a broken launch.
  *
- * omp takes the module named in the plugin manifest's `extensions` entry and uses its default export as the factory, so that export is all this file offers; everything else lives in `internals.ts`, where it can be tested.
+ * omp takes the module named in the plugin manifest's `extensions` entry and uses its default export as the factory, so that export is all this file offers; testable helpers live in sibling modules.
  */
 
 import type { ExtensionAPI, ExtensionContext } from '@oh-my-pi/pi-coding-agent';
@@ -14,6 +14,7 @@ import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { ANNOUNCEMENT_DELAY_MS, DEFAULT_INTERVAL_MS, NOT_EXECUTABLE, NOT_FOUND, PLUGIN_NAME, asInterval, claim, complaint, reason, asSources, dropPlaceholder, installArguments, installCommand, installedSkills, isEmpty, isInFlight, isSource, isStale, layout, linkSkills, normalize, readPluginSettings, resolveStaging, selectSkills, settleParked, staging, swap, sweepGuard } from './internals.ts';
 import type { Layout, NormalizedSource, Options, SkillSource, StagingState } from './internals.ts';
+import { configuredSkillTargets, selectedInstallCommand, selectedInstallPowerShellArguments, skillTargetsError } from './selective-installs.ts';
 
 /** Exhaustive against {@link Options} by construction: a key added there refuses to compile until it is mirrored here. */
 const KNOWN_OPTIONS: Record<keyof Options, null> = { sources: null, interval: null };
@@ -214,43 +215,52 @@ const voiceFor = (ctx: ExtensionContext) => {
 /** Targets already claimed by a refresh in this process, covering the gap before `gh` creates its staging directory. */
 const refreshingTargets = new Set<string>();
 
+const downloadOnWindows = (repo: string, pin: string | undefined, skills: string[] | undefined, incoming: string, done: string, failed: string, noise: string) => {
+	if (skills !== undefined) {
+		return spawn('powershell.exe', selectedInstallPowerShellArguments(repo, pin, skills, incoming, done, failed, noise), { stdio: 'ignore', detached: true });
+	}
+
+	/*
+	 * Where the shell's `2>` does the same job everywhere else: an exit code says a download failed, and only `gh` can say why.
+	 * A file that will not open costs the explanation and nothing more, so the download still goes ahead with the stream discarded.
+	 */
+	let stderr: number | 'ignore' = 'ignore';
+
+	try {
+		stderr = openSync(noise, 'w');
+	} catch {
+		// Nothing to read back later, which is where a missing complaint is already handled.
+	}
+
+	try {
+		return spawn('gh', installArguments(repo, pin, incoming), { stdio: ['ignore', 'ignore', stderr], detached: true });
+	} finally {
+		/*
+		 * The child holds its own copy from the moment it was spawned, so this one is closed either way.
+		 * A spawn that threw rather than returning is the reason for the `finally`: nothing downstream has a child to close it, and the refresh above catches the throw — so the launch would carry the descriptor for the rest of its life.
+		 */
+		if (stderr !== 'ignore') {
+			try {
+				closeSync(stderr);
+			} catch {
+				// A descriptor that will not close is a descriptor the launch keeps, which is not worth failing a download over.
+			}
+		}
+	}
+};
+
 /**
  * Starts the download and leaves it running.
  * Detached so it survives omp quitting: omp takes its process group with it, and a refresh that dies mid-download restarts from scratch on every launch — expensive against the skill API's rate limit.
- * A shell wraps `gh` only so that something which outlives this process can record how the download ended; the plugin's own handlers die with the parent.
- * Windows does not reap children with their parent, so there `gh` is spawned directly and the markers are the launch's own business.
+ * A shell wrapper owns selected multi-skill installs so all requested targets survive the parent process together; ordinary `--all` sources keep the existing direct Windows spawn and POSIX wrapper.
  */
-const download = (repo: string, pin: string | undefined, incoming: string, done: string, failed: string, pid: string, noise: string) => {
+const download = (repo: string, pin: string | undefined, skills: string[] | undefined, incoming: string, done: string, failed: string, pid: string, noise: string) => {
 	let child;
 
 	if (process.platform === 'win32') {
-		/*
-		 * Where the shell's `2>` does the same job everywhere else: an exit code says a download failed, and only `gh` can say why.
-		 * A file that will not open costs the explanation and nothing more, so the download still goes ahead with the stream discarded.
-		 */
-		let stderr: number | 'ignore' = 'ignore';
-
-		try {
-			stderr = openSync(noise, 'w');
-		} catch {
-			// Nothing to read back later, which is where a missing complaint is already handled.
-		}
-
-		try {
-			child = spawn('gh', installArguments(repo, pin, incoming), { stdio: ['ignore', 'ignore', stderr], detached: true });
-		} finally {
-			/*
-			 * The child holds its own copy from the moment it was spawned, so this one is closed either way.
-			 * A spawn that threw rather than returning is the reason for the `finally`: nothing downstream has a child to close it, and the refresh above catches the throw — so the launch would carry the descriptor for the rest of its life.
-			 */
-			if (stderr !== 'ignore') {
-				try {
-					closeSync(stderr);
-				} catch {
-					// A descriptor that will not close is a descriptor the launch keeps, which is not worth failing a download over.
-				}
-			}
-		}
+		child = downloadOnWindows(repo, pin, skills, incoming, done, failed, noise);
+	} else if (skills !== undefined) {
+		child = spawn('sh', ['-c', selectedInstallCommand(repo, pin, skills, incoming, done, failed, noise)], { stdio: 'ignore', detached: true });
 	} else {
 		child = spawn('sh', ['-c', installCommand(repo, pin, incoming, done, failed, noise)], { stdio: 'ignore', detached: true });
 	}
@@ -553,6 +563,7 @@ const refresh = (configured: SkillSource, dirs: Layout, defaultStaleAfter: numbe
 
 	try {
 		const normalized = normalize(configured, dirs.root);
+		const skills = configuredSkillTargets(configured);
 		label = normalized.label;
 		voiceId = normalized.target;
 		previousStamp = snapshotStamp(normalized.stamp, force);
@@ -584,7 +595,7 @@ const refresh = (configured: SkillSource, dirs: Layout, defaultStaleAfter: numbe
 		 */
 		notice = ctx.setTimeout(() => voice.toast(announcement, 'info'), ANNOUNCEMENT_DELAY_MS);
 
-		const install = download(repo, pin, incoming, done, failed, pid, noise);
+		const install = download(repo, pin, skills, incoming, done, failed, pid, noise);
 		downloadStarted = true;
 
 		log(`${label}: downloading into ${incoming}`);
@@ -653,8 +664,8 @@ const refresh = (configured: SkillSource, dirs: Layout, defaultStaleAfter: numbe
 		};
 
 		/**
-		 * Something stopped the child from ever running: `sh` on POSIX, `gh` itself on Windows, where it is spawned directly.
-		 * A missing `gh` is not this — the shell starts perfectly well and reports it as an exit code — so this reports the cause it was handed rather than guessing at one.
+		 * Something stopped the wrapper or direct `gh` process from ever running.
+		 * A missing `gh` inside a shell wrapper reports an exit code instead, so this reports the cause it was handed rather than guessing at one.
 		 */
 		const onError = (cause: unknown) => {
 			const speak = () => {
@@ -684,7 +695,7 @@ const refresh = (configured: SkillSource, dirs: Layout, defaultStaleAfter: numbe
 				return;
 			}
 
-			// The shell's verdict on a `gh` it could not run, which is what a missing `gh` looks like everywhere the download goes through `sh`.
+			// The wrapper's verdict on a `gh` it could not run, which is what a missing `gh` looks like for selected installs and POSIX `--all` refreshes.
 			if (code === NOT_FOUND || code === NOT_EXECUTABLE) {
 				finish(speakOnFailure('`gh` is not installed, or not on PATH'));
 				return;
@@ -695,8 +706,8 @@ const refresh = (configured: SkillSource, dirs: Layout, defaultStaleAfter: numbe
 
 				finish(() => {
 					/*
-					 * Windows parity for the cooldown: the wrapper writes this marker everywhere the download goes through `sh`, but a `gh` spawned bare records nothing, and an expired login would otherwise cost an attempt per launch.
-					 * Everywhere else it is already on disk, and rewriting it only freshens the mtime the cooldown reads.
+					 * Windows parity for the cooldown: wrappers write this marker themselves, while a bare `gh` spawned for an ordinary Windows `--all` refresh records nothing.
+					 * Rewriting an existing marker only freshens the mtime the cooldown reads.
 					 */
 					writeFileSync(failed, '');
 
@@ -708,7 +719,7 @@ const refresh = (configured: SkillSource, dirs: Layout, defaultStaleAfter: numbe
 
 			/*
 			 * In-process fast path for a launch that lives to see it; the marker left behind lets a later launch finish the job.
-			 * Written here as well as by the wrapper, because on Windows this is the only writer there is — and the claim inside `complete` expects every caller to hold one.
+			 * Written here as well as by wrappers, because on ordinary Windows `--all` refreshes this is the only writer there is, and the claim inside `complete` expects every caller to hold one.
 			 */
 			finish(() => {
 				writeFileSync(done, '');
@@ -782,9 +793,16 @@ const configuration = async (cwd: string, voice: Voice, log: Log): Promise<Confi
 	const sources: SkillSource[] = [];
 
 	for (const configured of configuredSources) {
+		const skillsError = skillTargetsError(configured);
+		if (skillsError !== undefined) {
+			log(`ignoring a malformed source: ${JSON.stringify(configured)}: ${skillsError}`);
+			voice.toast(`Ignoring a malformed source: ${JSON.stringify(configured)}. ${skillsError}.`, 'error');
+			continue;
+		}
+
 		if (!isSource(configured)) {
 			log(`ignoring a malformed source: ${JSON.stringify(configured)}`);
-			voice.toast(`Ignoring a malformed source: ${JSON.stringify(configured)}. A source is an \`owner/repo\`, or an object with \`repo\`, optional \`interval\` as non-negative milliseconds or false, \`pin\`/\`target\`/\`stamp\`/\`label\` strings, \`placeholder\` as a directory name or false, and \`include\`/\`exclude\` arrays of exact skill names.`, 'error');
+			voice.toast(`Ignoring a malformed source: ${JSON.stringify(configured)}. A source is an \`owner/repo\`, or an object with \`repo\`, optional \`interval\` as non-negative milliseconds or false, \`pin\`/\`target\`/\`stamp\`/\`label\` strings, \`placeholder\` as a directory name or false, \`skills\` as a non-empty array of unique exact skill targets, and \`include\`/\`exclude\` arrays of exact skill names.`, 'error');
 			continue;
 		}
 
