@@ -146,8 +146,18 @@ const powerShellInvocation = (args: string[], failed: string) => {
 
 	return [
 		`$arguments = @(${literals})`,
-		'if ($captureNoise) { & gh @arguments 2>> $noise } else { & gh @arguments 2>$null }',
-		'$rc = $LASTEXITCODE',
+		'if ($captureNoise) {',
+		'\t& gh @arguments 2> $nativeNoise',
+		'\t$rc = $LASTEXITCODE',
+		'\ttry {',
+		'\t\t$nativeText = Get-Content -LiteralPath $nativeNoise -Raw -ErrorAction SilentlyContinue',
+		'\t\tif ($null -ne $nativeText) { [System.IO.File]::AppendAllText($noise, $nativeText, $utf8) }',
+		'\t} catch {}',
+		'\ttry { Remove-Item -LiteralPath $nativeNoise -Force -ErrorAction SilentlyContinue } catch {}',
+		'} else {',
+		'\t& gh @arguments 2>$null',
+		'\t$rc = $LASTEXITCODE',
+		'}',
 		'if ($rc -ne 0) {',
 		`\tif ($rc -ne 127 -and $rc -ne 126) { try { [System.IO.File]::WriteAllText(${psq(failed)}, '') } catch {} }`,
 		'\texit $rc',
@@ -161,6 +171,7 @@ const powerShellInvocation = (args: string[], failed: string) => {
  */
 const selectedInstallPowerShellArguments = (repo: string, pin: string | undefined, skills: string[], incoming: string, done: string, failed: string, noise: string) => {
 	const scriptPath = `${noise}.ps1`;
+	const nativeNoise = `${noise}.native`;
 	const commands = skills
 		.map((skill) => powerShellInvocation(selectedInstallArguments(repo, pin, skill, incoming), failed))
 		.join('\n');
@@ -170,8 +181,10 @@ const selectedInstallPowerShellArguments = (repo: string, pin: string | undefine
 		`try { Remove-Item -LiteralPath ${psq(scriptPath)} -Force -ErrorAction SilentlyContinue } catch {}`,
 		'if ($null -eq (Get-Command gh -ErrorAction SilentlyContinue)) { exit 127 }',
 		`$noise = ${psq(noise)}`,
+		`$nativeNoise = ${psq(nativeNoise)}`,
+		'$utf8 = [System.Text.UTF8Encoding]::new($false)',
 		'$captureNoise = $true',
-		'try { [System.IO.File]::WriteAllText($noise, \'\') } catch { $captureNoise = $false }',
+		'try { [System.IO.File]::WriteAllText($noise, \'\', $utf8) } catch { $captureNoise = $false }',
 		commands,
 		`try { [System.IO.File]::WriteAllText(${psq(done)}, '') } catch {}`,
 		'exit 0'

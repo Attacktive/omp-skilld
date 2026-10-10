@@ -100,6 +100,8 @@ describe(
 					expect(script)
 						.toContain("'--', 'skills/engineering/skill-19'");
 					expect(script)
+						.toContain('[System.IO.File]::AppendAllText($noise, $nativeText, $utf8)');
+					expect(script)
 						.not.toContain("$ErrorActionPreference = 'Stop'");
 				} finally {
 					rmSync(root, { recursive: true, force: true });
@@ -129,6 +131,7 @@ describe(
 					environment[pathKey] = `${root}${delimiter}${environment[pathKey] ?? ''}`;
 
 					const result = spawnSync('powershell.exe', args, { env: environment, stdio: 'ignore' });
+					const noiseBytes = readFileSync(noise);
 
 					expect(result.status)
 						.toBe(0);
@@ -136,9 +139,53 @@ describe(
 						.toBe(true);
 					expect(existsSync(failed))
 						.toBe(false);
-					expect(readFileSync(noise).length)
-						.toBeGreaterThan(0);
+					expect(noiseBytes.toString('utf8'))
+						.toContain('Using ref v7.0.0');
+					expect(noiseBytes.includes(0))
+						.toBe(false);
 					expect(existsSync(`${noise}.ps1`))
+						.toBe(false);
+				} finally {
+					rmSync(root, { recursive: true, force: true });
+				}
+			}
+		);
+
+		it(
+			'keeps selected Windows failure diagnostics readable as UTF-8',
+			() => {
+				if (process.platform !== 'win32') {
+					return;
+				}
+
+				const root = mkdtempSync(join(tmpdir(), 'omp-skilld-'));
+
+				try {
+					const gh = join(root, 'gh.cmd');
+					const done = join(root, 'done');
+					const failed = join(root, 'failed');
+					const noise = join(root, 'noise');
+					writeFileSync(gh, '@echo off\r\necho gh: authentication expired 1>&2\r\nexit /b 1\r\n');
+
+					const args = selectedInstallPowerShellArguments('owner/repo', undefined, ['pdf'], join(root, 'incoming'), done, failed, noise);
+					const environment = { ...process.env };
+					const pathKey = Object.keys(environment).find((key) => key.toLowerCase() === 'path') ?? 'PATH';
+					environment[pathKey] = `${root}${delimiter}${environment[pathKey] ?? ''}`;
+
+					const result = spawnSync('powershell.exe', args, { env: environment, stdio: 'ignore' });
+					const noiseBytes = readFileSync(noise);
+
+					expect(result.status)
+						.toBe(1);
+					expect(existsSync(done))
+						.toBe(false);
+					expect(existsSync(failed))
+						.toBe(true);
+					expect(noiseBytes.toString('utf8'))
+						.toContain('gh: authentication expired');
+					expect(noiseBytes.includes(0))
+						.toBe(false);
+					expect(existsSync(`${noise}.native`))
 						.toBe(false);
 				} finally {
 					rmSync(root, { recursive: true, force: true });
