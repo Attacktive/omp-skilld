@@ -26,7 +26,8 @@ jobs:
     # Seven models at the five-minute request timeout each is the worst case two providers allow, and a run past that is hung rather than slow.
     # Generous on purpose: this is a required check, so a job killed for being slow goes red and blocks a merge — which is the one thing a review that cannot fail anything must never do.
     timeout-minutes: 60
-    if: github.actor != 'dependabot[bot]'
+    # 49699333 is the GitHub.com account ID for dependabot[bot].
+    if: 'github.event.sender.id != 49699333'
     permissions:
       contents: 'read'
       pull-requests: 'write'
